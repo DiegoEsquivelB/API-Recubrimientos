@@ -31,8 +31,12 @@ La API quedará disponible en `http://localhost:3000`.
 - `POST /api/auth/login`
 - `POST /api/auth/usuarios`
 - `GET|POST /api/clientes`
+- `GET|PUT|DELETE /api/clientes/:id`
 - `GET|POST /api/materiales`
+- `GET|PUT|DELETE /api/materiales/:id`
 - `GET|POST /api/proyectos`
+- `GET|PUT|DELETE /api/proyectos/:id`
 - `GET|POST /api/inventario/movimientos`
+- `GET|PUT|DELETE /api/inventario/movimientos/:id`
 
 Las contraseñas deben enviarse en texto plano únicamente por HTTPS en producción; la API las almacena cifradas con bcrypt.
