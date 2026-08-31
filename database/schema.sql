@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS usuarios (
   fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+INSERT IGNORE INTO usuarios (nombre, email, password_hash, rol, estado) VALUES
+  ('Administrador', 'admin@recubrimientos.com', '$2b$12$Np994fk847eQY0DN1B.fcOSCIG0wsexK8rvXvpYNJ1C1J1A9Fp5fS', 'Administrador', 'Activo');
+
 CREATE TABLE IF NOT EXISTS clientes (
   id_cliente INT AUTO_INCREMENT PRIMARY KEY,
   nombre VARCHAR(120) NOT NULL,
@@ -26,31 +29,60 @@ CREATE TABLE IF NOT EXISTS materiales (
   id_material INT AUTO_INCREMENT PRIMARY KEY,
   codigo VARCHAR(20) NOT NULL UNIQUE,
   nombre VARCHAR(100) NOT NULL,
-  tipo ENUM('Pintura', 'Sellador', 'Esmalte', 'Impermeabilizante', 'Accesorio') NOT NULL,
+  tipo VARCHAR(60) NOT NULL,
   rendimiento_m2_gal DECIMAL(10,2) NOT NULL DEFAULT 35.00,
   precio_unitario DECIMAL(10,2) NOT NULL,
   unidad_medida VARCHAR(20) NOT NULL DEFAULT 'Galón'
 );
 
+CREATE TABLE IF NOT EXISTS material_categorias (
+  id_categoria INT AUTO_INCREMENT PRIMARY KEY,
+  nombre VARCHAR(60) NOT NULL UNIQUE,
+  fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT IGNORE INTO material_categorias (nombre) VALUES
+  ('Pintura'),
+  ('Sellador'),
+  ('Esmalte'),
+  ('Impermeabilizante'),
+  ('Accesorio');
+
 CREATE TABLE IF NOT EXISTS inventario (
   id_inventario INT AUTO_INCREMENT PRIMARY KEY,
   id_material INT NOT NULL,
-  stock_actual INT NOT NULL DEFAULT 0,
-  stock_minimo INT NOT NULL DEFAULT 5,
+  stock_actual DECIMAL(10,2) NOT NULL DEFAULT 0,
+  stock_minimo DECIMAL(10,2) NOT NULL DEFAULT 5,
   fecha_ultima_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (id_material) REFERENCES materiales(id_material) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS movimientos_inventario (
+  id_movimiento INT AUTO_INCREMENT PRIMARY KEY,
+  material_id INT NOT NULL,
+  id_usuario INT,
+  tipo ENUM('Entrada', 'Salida') NOT NULL,
+  fecha DATE NOT NULL,
+  cantidad DECIMAL(10,2) NOT NULL,
+  referencia VARCHAR(120),
+  notas TEXT,
+  fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (material_id) REFERENCES materiales(id_material),
+  FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS proyectos (
   id_proyecto INT AUTO_INCREMENT PRIMARY KEY,
   id_cliente INT NOT NULL,
+  id_usuario INT NOT NULL,
   nombre_proyecto VARCHAR(150) NOT NULL,
   area_m2 DECIMAL(10,2) NOT NULL,
   estado ENUM('Pendiente', 'En proceso', 'Finalizado') NOT NULL DEFAULT 'Pendiente',
   costo_estimado DECIMAL(10,2) DEFAULT 0.00,
   fecha_inicio DATE,
   fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente)
+  FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente),
+  FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario)
 );
 
 CREATE TABLE IF NOT EXISTS proyecto_materiales (

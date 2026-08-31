@@ -39,4 +39,3 @@ La API quedará disponible en `http://localhost:3000`.
 - `GET|POST /api/inventario/movimientos`
 - `GET|PUT|DELETE /api/inventario/movimientos/:id`
 
-Las contraseñas deben enviarse en texto plano únicamente por HTTPS en producción; la API las almacena cifradas con bcrypt.
