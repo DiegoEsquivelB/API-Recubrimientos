@@ -39,3 +39,7 @@ La API quedará disponible en `http://localhost:3000`.
 - `GET|POST /api/inventario/movimientos`
 - `GET|PUT|DELETE /api/inventario/movimientos/:id`
 
+
+## Usuario Predeterminado
+Usuario: admin@recubrimientos.com
+Contraseña: admin123
