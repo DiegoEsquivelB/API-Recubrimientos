@@ -1,4 +1,5 @@
 const path = require('node:path');
+const crypto = require('node:crypto');
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -7,6 +8,14 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
+const sessionCookieName = process.env.SESSION_COOKIE_NAME || 'recubrimientos_session';
+const sessionSecret = process.env.SESSION_SECRET || 'recubrimientos-dev-session-secret';
+const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 8);
+const rememberSessionTtlMs = Number(process.env.REMEMBER_SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 30);
+const cookieSameSite = process.env.COOKIE_SAMESITE || 'lax';
+const cookieSecure = process.env.COOKIE_SECURE
+  ? process.env.COOKIE_SECURE === 'true'
+  : process.env.NODE_ENV === 'production';
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   port: Number(process.env.DB_PORT || 3306),
@@ -16,6 +25,96 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10
 });
+
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+function base64UrlJson(value) {
+  return base64UrlEncode(JSON.stringify(value));
+}
+
+function signSessionPayload(payload) {
+  return crypto
+    .createHmac('sha256', sessionSecret)
+    .update(payload)
+    .digest('base64url');
+}
+
+function createSessionToken(user, remember = false) {
+  const expiresAt = Date.now() + (remember ? rememberSessionTtlMs : sessionTtlMs);
+  const payload = base64UrlJson({
+    sub: user.id_usuario,
+    nombre: user.nombre,
+    email: user.email,
+    rol: user.rol,
+    exp: expiresAt
+  });
+  return `${payload}.${signSessionPayload(payload)}`;
+}
+
+function parseCookies(cookieHeader = '') {
+  return cookieHeader.split(';').reduce((cookies, item) => {
+    const [rawName, ...rawValue] = item.trim().split('=');
+    if (!rawName) return cookies;
+    cookies[rawName] = decodeURIComponent(rawValue.join('=') || '');
+    return cookies;
+  }, {});
+}
+
+function verifySessionToken(token) {
+  if (!token || !token.includes('.')) return null;
+  const [payload, signature] = token.split('.');
+  const expectedSignature = signSessionPayload(payload);
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expectedSignature);
+
+  if (signatureBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) {
+    return null;
+  }
+
+  try {
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!session.exp || Date.now() > Number(session.exp)) return null;
+    return session;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function getSessionFromRequest(request) {
+  const cookies = parseCookies(request.headers.cookie || '');
+  return verifySessionToken(cookies[sessionCookieName]);
+}
+
+function sessionCookieOptions(remember = false) {
+  return {
+    httpOnly: true,
+    secure: cookieSecure,
+    sameSite: cookieSameSite,
+    path: '/api',
+    maxAge: remember ? rememberSessionTtlMs : sessionTtlMs
+  };
+}
+
+function clearSessionCookie(response) {
+  response.clearCookie(sessionCookieName, {
+    httpOnly: true,
+    secure: cookieSecure,
+    sameSite: cookieSameSite,
+    path: '/api'
+  });
+}
+
+function requireAuth(request, response, next) {
+  const session = getSessionFromRequest(request);
+  if (!session) {
+    return response.status(401).json({ message: 'Debe iniciar sesión para continuar.' });
+  }
+
+  request.user = session;
+  next();
+}
 
 async function ensureDefaultAdminUser() {
   await pool.execute(
@@ -140,7 +239,8 @@ app.use(cors({
     'http://localhost:5500'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type'],
+  credentials: true
 }));
 
 app.use(express.json());
@@ -170,7 +270,7 @@ app.get('/api/health', async (_request, response) => {
 });
 
 app.post('/api/auth/login', async (request, response) => {
-  const { usuario, contrasena } = request.body;
+  const { usuario, contrasena, recordar } = request.body;
   if (!usuario || !contrasena) return response.status(400).json({ message: 'Usuario y contraseña son obligatorios.' });
   try {
     await ensureDefaultAdminUser();
@@ -185,6 +285,8 @@ app.post('/api/auth/login', async (request, response) => {
     if (!user || !(await bcrypt.compare(contrasena, user.password_hash))) {
       return response.status(401).json({ message: 'Las credenciales no son válidas.' });
     }
+    const rememberSession = ['1', 'true', 'on', true, 1].includes(recordar);
+    response.cookie(sessionCookieName, createSessionToken(user, rememberSession), sessionCookieOptions(rememberSession));
     response.json({
       user: {
         id: user.id_usuario,
@@ -201,7 +303,61 @@ app.post('/api/auth/login', async (request, response) => {
   }
 });
 
-app.post('/api/auth/usuarios', async (request, response) => {
+app.get('/api/auth/session', (request, response) => {
+  const session = getSessionFromRequest(request);
+  if (!session) return response.status(401).json({ authenticated: false, message: 'Sesión no válida o expirada.' });
+
+  response.json({
+    authenticated: true,
+    user: {
+      id: session.sub,
+      id_usuario: session.sub,
+      nombre: session.nombre,
+      usuario: session.email,
+      email: session.email,
+      rol: session.rol
+    }
+  });
+});
+
+app.get('/api/auth/me', async (request, response) => {
+  const session = getSessionFromRequest(request);
+  if (!session) return response.status(401).json({ message: 'Debe iniciar sesión para continuar.' });
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT id_usuario, nombre, email, rol, estado
+       FROM usuarios
+       WHERE id_usuario = ?
+       LIMIT 1`,
+      [session.sub]
+    );
+
+    const user = rows[0];
+    if (!user) return response.status(404).json({ message: 'Usuario no encontrado.' });
+
+    response.json({
+      id: user.id_usuario,
+      id_usuario: user.id_usuario,
+      nombre: user.nombre,
+      usuario: user.email,
+      email: user.email,
+      rol: user.rol,
+      estado: user.estado
+    });
+  } catch (_error) {
+    response.status(500).json({ message: 'No fue posible obtener el usuario actual.' });
+  }
+});
+
+app.post('/api/auth/logout', (_request, response) => {
+  clearSessionCookie(response);
+  response.json({ message: 'Sesión cerrada correctamente.' });
+});
+
+app.use('/api', requireAuth);
+
+async function crearUsuario(request, response) {
   const { nombre, usuario, email, contrasena, rol = 'Operador' } = request.body;
   const userEmail = email || usuario;
   if (!nombre || !usuario || !contrasena) return response.status(400).json({ message: 'Nombre, usuario y contraseña son obligatorios.' });
@@ -215,7 +371,10 @@ app.post('/api/auth/usuarios', async (request, response) => {
   } catch (error) {
     response.status(error.code === 'ER_DUP_ENTRY' ? 409 : 500).json({ message: 'No fue posible crear el usuario.' });
   }
-});
+}
+
+app.post('/api/usuarios', crearUsuario);
+app.post('/api/auth/usuarios', crearUsuario);
 
 app.get('/api/usuarios', async (_request, response) => {
   try {
@@ -235,6 +394,87 @@ app.get('/api/usuarios', async (_request, response) => {
     response.json(rows);
   } catch (_error) {
     response.status(500).json({ message: 'No fue posible consultar los usuarios.' });
+  }
+});
+
+app.get('/api/usuarios/:id', async (request, response) => {
+  try {
+    const [rows] = await pool.execute(`
+      SELECT
+        id_usuario AS id,
+        id_usuario,
+        nombre,
+        email AS correo,
+        email,
+        rol,
+        estado,
+        fecha_creacion
+      FROM usuarios
+      WHERE id_usuario = ?
+    `, [request.params.id]);
+
+    if (!rows[0]) return response.status(404).json({ message: 'Usuario no encontrado.' });
+    response.json(rows[0]);
+  } catch (_error) {
+    response.status(500).json({ message: 'No fue posible consultar el usuario.' });
+  }
+});
+
+app.put('/api/usuarios/:id', async (request, response) => {
+  const { nombre, email, usuario, rol = 'Operador', estado = 'Activo', contrasena } = request.body;
+  const userEmail = email || usuario;
+
+  if (!nombre || !userEmail) {
+    return response.status(400).json({ message: 'Nombre y correo son obligatorios.' });
+  }
+
+  try {
+    const updateValues = [nombre, userEmail, rol, estado, request.params.id];
+    let query = 'UPDATE usuarios SET nombre = ?, email = ?, rol = ?, estado = ?';
+
+    if (contrasena) {
+      const hash = await bcrypt.hash(contrasena, 12);
+      query += ', password_hash = ?';
+      updateValues.splice(4, 0, hash);
+    }
+
+    query += ' WHERE id_usuario = ?';
+
+    const [result] = await pool.execute(query, updateValues);
+    if (result.affectedRows === 0) return response.status(404).json({ message: 'Usuario no encontrado.' });
+
+    if (request.user && Number(request.user.sub) === Number(request.params.id)) {
+      const refreshedUser = {
+        id_usuario: Number(request.params.id),
+        nombre,
+        email: userEmail,
+        rol,
+        estado
+      };
+      response.cookie(
+        sessionCookieName,
+        createSessionToken(refreshedUser),
+        sessionCookieOptions(false)
+      );
+    }
+
+    response.json({ message: 'Usuario actualizado correctamente.' });
+  } catch (error) {
+    response.status(error.code === 'ER_DUP_ENTRY' ? 409 : 500).json({
+      message: error.code === 'ER_DUP_ENTRY'
+        ? 'El correo electrónico ya está registrado.'
+        : 'No fue posible actualizar el usuario.'
+    });
+  }
+});
+
+app.delete('/api/usuarios/:id', async (request, response) => {
+  try {
+    const [result] = await pool.execute('DELETE FROM usuarios WHERE id_usuario = ?', [request.params.id]);
+    if (result.affectedRows === 0) return response.status(404).json({ message: 'Usuario no encontrado.' });
+    response.json({ message: 'Usuario eliminado correctamente.' });
+  } catch (_error) {
+    response.status(500).json({ message: 'No fue posible eliminar el usuario.' });
   }
 });
 
