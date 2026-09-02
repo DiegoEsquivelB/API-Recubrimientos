@@ -96,6 +96,98 @@ function resolveProjectUserId(request, requestUserId) {
   return session ? session.sub : null;
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function resolveMaterialCategoryId(connection, categoryInput, categoryNameFallback = null) {
+  const rawValue = categoryInput ?? categoryNameFallback ?? null;
+  if (rawValue === null || rawValue === undefined || rawValue === '') {
+    return null;
+  }
+
+  const normalizedId = Number(rawValue);
+  if (Number.isInteger(normalizedId) && normalizedId > 0) {
+    const [existingRows] = await connection.execute(
+      'SELECT id_categoria FROM material_categorias WHERE id_categoria = ? LIMIT 1',
+      [normalizedId]
+    );
+    if (existingRows[0]) {
+      return normalizedId;
+    }
+  }
+
+  const categoryName = String(rawValue).trim();
+  if (!categoryName) {
+    return null;
+  }
+
+  const [rows] = await connection.execute(
+    'SELECT id_categoria FROM material_categorias WHERE nombre = ? LIMIT 1',
+    [categoryName]
+  );
+  if (rows[0]) {
+    return rows[0].id_categoria;
+  }
+
+  const [insertResult] = await connection.execute(
+    'INSERT INTO material_categorias (nombre, prefijo_codigo) VALUES (?, ?)',
+    [categoryName, categoryName.slice(0, 3).toUpperCase()]
+  );
+  return insertResult.insertId;
+}
+
+async function generateMaterialCode(connection, categoryInput, categoryNameFallback = null) {
+  const rawValue = categoryInput ?? categoryNameFallback ?? null;
+  let categoryRecord = null;
+
+  if (rawValue !== null && rawValue !== undefined && rawValue !== '') {
+    const normalizedId = Number(rawValue);
+    if (Number.isInteger(normalizedId) && normalizedId > 0) {
+      const [rows] = await connection.execute(
+        'SELECT id_categoria, nombre, prefijo_codigo FROM material_categorias WHERE id_categoria = ? LIMIT 1',
+        [normalizedId]
+      );
+      if (rows[0]) categoryRecord = rows[0];
+    }
+
+    if (!categoryRecord) {
+      const categoryName = String(rawValue).trim();
+      if (categoryName) {
+        const [rows] = await connection.execute(
+          'SELECT id_categoria, nombre, prefijo_codigo FROM material_categorias WHERE nombre = ? LIMIT 1',
+          [categoryName]
+        );
+        if (rows[0]) categoryRecord = rows[0];
+      }
+    }
+  }
+
+  const basePrefix = (categoryRecord?.prefijo_codigo || categoryRecord?.nombre || categoryNameFallback || 'MAT')
+    .toString()
+    .replace(/[^A-Za-z]/g, '')
+    .slice(0, 10)
+    .toUpperCase() || 'MAT';
+
+  const normalizedPrefix = basePrefix || 'MAT';
+  const safePrefix = escapeRegExp(normalizedPrefix);
+  const [rows] = await connection.execute(
+    'SELECT codigo FROM materiales WHERE codigo LIKE ? ORDER BY codigo DESC',
+    [`${normalizedPrefix}-%`]
+  );
+
+  let maxNumber = 0;
+  for (const row of rows) {
+    const match = String(row.codigo || '').match(new RegExp(`^${safePrefix}-(\\d+)$`, 'i'));
+    if (match) {
+      const numericValue = Number(match[1] || 0);
+      if (numericValue > maxNumber) maxNumber = numericValue;
+    }
+  }
+
+  return `${normalizedPrefix}-${String(maxNumber + 1).padStart(3, '0')}`;
+}
+
 function sessionCookieOptions(remember = false) {
   return {
     httpOnly: true,
@@ -146,18 +238,43 @@ async function ensureMaterialCategorySupport() {
     CREATE TABLE IF NOT EXISTS material_categorias (
       id_categoria INT AUTO_INCREMENT PRIMARY KEY,
       nombre VARCHAR(60) NOT NULL UNIQUE,
+      prefijo_codigo VARCHAR(10) NULL,
       fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
+  try {
+    await pool.query('ALTER TABLE material_categorias ADD COLUMN prefijo_codigo VARCHAR(10) NULL');
+  } catch (_error) {
+    // Existing installations may already include this column.
+  }
+
+  const categoryDefaults = {
+    Pintura: 'PIN',
+    Sellador: 'SEL',
+    Esmalte: 'ESM',
+    Impermeabilizante: 'IMP',
+    Accesorio: 'ACC'
+  };
+
   for (const category of DEFAULT_MATERIAL_CATEGORIES) {
-    await pool.execute('INSERT IGNORE INTO material_categorias (nombre) VALUES (?)', [category]);
+    const prefix = categoryDefaults[category] || category.slice(0, 3).toUpperCase();
+    await pool.execute(
+      'INSERT INTO material_categorias (nombre, prefijo_codigo) VALUES (?, ?) ON DUPLICATE KEY UPDATE prefijo_codigo = VALUES(prefijo_codigo)',
+      [category, prefix]
+    );
   }
 
   try {
     await pool.query('ALTER TABLE materiales MODIFY tipo VARCHAR(60) NOT NULL');
   } catch (_error) {
     // If the column is already compatible or the DB user cannot alter it, the API can still use existing categories.
+  }
+
+  try {
+    await pool.query('ALTER TABLE materiales ADD COLUMN descripcion TEXT NULL');
+  } catch (_error) {
+    // Existing installations may already have the column.
   }
 }
 
@@ -607,12 +724,14 @@ app.get('/api/clientes/:id', async (request, response) => {
 });
 
 app.post('/api/clientes', async (request, response) => {
-  const { nombre, identificacion, telefono, correo, direccion, notas } = request.body;
+  const { nombre, identificacion, telefono, correo, direccion, notas, id_usuario, usuario_id, usuario } = request.body;
+  const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
+  const finalUserId = id_usuario || usuario_id || usuario || sessionUserId || null;
   if (!nombre || !identificacion || !telefono) return response.status(400).json({ message: 'Nombre, identificación y teléfono son obligatorios.' });
   try {
     const [result] = await pool.execute(
-      'INSERT INTO clientes (nombre, identificacion, telefono, correo, direccion, notas) VALUES (?, ?, ?, ?, ?, ?)',
-      [nombre, identificacion, telefono, correo || null, direccion || null, notas || null]
+      'INSERT INTO clientes (id_usuario, nombre, identificacion, telefono, correo, direccion, notas) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [finalUserId, nombre, identificacion, telefono, correo || null, direccion || null, notas || null]
     );
     response.status(201).json({ id_cliente: result.insertId, message: 'Cliente guardado correctamente.' });
   } catch (error) {
@@ -625,14 +744,16 @@ app.post('/api/clientes', async (request, response) => {
 });
 
 app.put('/api/clientes/:id', async (request, response) => {
-  const { nombre, identificacion, telefono, correo, direccion, notas } = request.body;
+  const { nombre, identificacion, telefono, correo, direccion, notas, id_usuario, usuario_id, usuario } = request.body;
+  const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
+  const finalUserId = id_usuario || usuario_id || usuario || sessionUserId || null;
   if (!nombre || !identificacion || !telefono) return response.status(400).json({ message: 'Nombre, identificación y teléfono son obligatorios.' });
   try {
     const [result] = await pool.execute(
       `UPDATE clientes
-       SET nombre = ?, identificacion = ?, telefono = ?, correo = ?, direccion = ?, notas = ?
+       SET id_usuario = ?, nombre = ?, identificacion = ?, telefono = ?, correo = ?, direccion = ?, notas = ?
        WHERE id_cliente = ?`,
-      [nombre, identificacion, telefono, correo || null, direccion || null, notas || null, request.params.id]
+      [finalUserId, nombre, identificacion, telefono, correo || null, direccion || null, notas || null, request.params.id]
     );
     if (result.affectedRows === 0) return response.status(404).json({ message: 'Cliente no encontrado.' });
     response.json({ message: 'Cliente actualizado correctamente.' });
@@ -672,6 +793,7 @@ app.get('/api/materiales', async (_request, response) => {
         m.rendimiento_m2_gal,
         m.precio_unitario AS costo,
         m.precio_unitario,
+        m.descripcion,
         COALESCE(i.stock_minimo, 0) AS stock_minimo
       FROM materiales m
       LEFT JOIN inventario i ON i.id_material = m.id_material
@@ -686,7 +808,7 @@ app.get('/api/materiales', async (_request, response) => {
 app.get('/api/materiales/categorias', async (_request, response) => {
   try {
     await ensureMaterialCategorySupport();
-    const [rows] = await pool.query('SELECT id_categoria AS id, nombre FROM material_categorias ORDER BY nombre ASC');
+    const [rows] = await pool.query('SELECT id_categoria AS id, nombre, prefijo_codigo FROM material_categorias ORDER BY nombre ASC');
     response.json(rows);
   } catch (_error) {
     response.status(500).json({ message: 'No fue posible consultar las categorías.' });
@@ -695,12 +817,14 @@ app.get('/api/materiales/categorias', async (_request, response) => {
 
 app.post('/api/materiales/categorias', async (request, response) => {
   const nombre = String(request.body.nombre || '').trim();
+  const prefijoCodigo = String(request.body.prefijo_codigo || '').trim();
   if (!nombre) return response.status(400).json({ message: 'El nombre de la categoría es obligatorio.' });
 
   try {
     await ensureMaterialCategorySupport();
-    const [result] = await pool.execute('INSERT INTO material_categorias (nombre) VALUES (?)', [nombre]);
-    response.status(201).json({ id: result.insertId, nombre, message: 'Categoría guardada correctamente.' });
+    const finalPrefijo = prefijoCodigo ? prefijoCodigo.replace(/[^A-Za-z]/g, '').slice(0, 10).toUpperCase() : nombre.replace(/[^A-Za-z]/g, '').slice(0, 3).toUpperCase() || 'MAT';
+    const [result] = await pool.execute('INSERT INTO material_categorias (nombre, prefijo_codigo) VALUES (?, ?)', [nombre, finalPrefijo]);
+    response.status(201).json({ id: result.insertId, nombre, prefijo_codigo: finalPrefijo, message: 'Categoría guardada correctamente.' });
   } catch (error) {
     response.status(error.code === 'ER_DUP_ENTRY' ? 409 : 500).json({
       message: error.code === 'ER_DUP_ENTRY'
@@ -712,20 +836,22 @@ app.post('/api/materiales/categorias', async (request, response) => {
 
 app.put('/api/materiales/categorias/:id', async (request, response) => {
   const nombre = String(request.body.nombre || '').trim();
+  const prefijoCodigo = String(request.body.prefijo_codigo || '').trim();
   if (!nombre) return response.status(400).json({ message: 'El nombre de la categoría es obligatorio.' });
 
   const connection = await pool.getConnection();
   try {
     await ensureMaterialCategorySupport();
     await connection.beginTransaction();
-    const [rows] = await connection.execute('SELECT nombre FROM material_categorias WHERE id_categoria = ?', [request.params.id]);
+    const [rows] = await connection.execute('SELECT nombre, prefijo_codigo FROM material_categorias WHERE id_categoria = ?', [request.params.id]);
     if (!rows[0]) {
       await connection.rollback();
       return response.status(404).json({ message: 'Categoría no encontrada.' });
     }
 
     const previousName = rows[0].nombre;
-    await connection.execute('UPDATE material_categorias SET nombre = ? WHERE id_categoria = ?', [nombre, request.params.id]);
+    const finalPrefijo = prefijoCodigo ? prefijoCodigo.replace(/[^A-Za-z]/g, '').slice(0, 10).toUpperCase() : (rows[0].prefijo_codigo || nombre.replace(/[^A-Za-z]/g, '').slice(0, 3).toUpperCase() || 'MAT');
+    await connection.execute('UPDATE material_categorias SET nombre = ?, prefijo_codigo = ? WHERE id_categoria = ?', [nombre, finalPrefijo, request.params.id]);
     await connection.execute('UPDATE materiales SET tipo = ? WHERE tipo = ?', [nombre, previousName]);
     await connection.commit();
     response.json({ message: 'Categoría actualizada correctamente.' });
@@ -776,6 +902,7 @@ app.get('/api/materiales/:id', async (request, response) => {
         m.rendimiento_m2_gal,
         m.precio_unitario AS costo,
         m.precio_unitario,
+        m.descripcion,
         COALESCE(i.stock_minimo, 0) AS stock_minimo
       FROM materiales m
       LEFT JOIN inventario i ON i.id_material = m.id_material
@@ -803,43 +930,55 @@ app.post('/api/materiales', async (request, response) => {
     stock_minimo,
     registrar_inventario,
     stock_inicial,
-    referencia_inventario
+    referencia_inventario,
+    descripcion,
+    id_usuario,
+    usuario_id,
+    usuario,
+    id_categoria,
+    categoria_id
   } = request.body;
   const materialTipo = categoria || tipo;
   const unidadMedida = unidad || unidad_medida || 'Galón';
-  const rendimientoMaterial = rendimiento || rendimiento_m2_gal || 35;
+  const rendimientoMaterial = Number(rendimiento ?? rendimiento_m2_gal ?? 0);
   const precioUnitario = costo || precio_unitario || 0;
   const stockMinimo = stock_minimo || 0;
+  const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
+  const finalUserId = id_usuario || usuario_id || usuario || sessionUserId || null;
   const shouldRegisterInventory = ['1', 'true', 'on', true, 1].includes(registrar_inventario);
   const initialStock = Number(stock_inicial || 0);
-
-  if (!codigo || !nombre || !materialTipo || !unidadMedida) {
-    return response.status(400).json({ message: 'Código, nombre, categoría y unidad son obligatorios.' });
-  }
-
-  if (shouldRegisterInventory && (!Number.isFinite(initialStock) || initialStock <= 0)) {
-    return response.status(400).json({ message: 'La cantidad inicial debe ser mayor a cero.' });
-  }
 
   await ensureMaterialCategorySupport();
   await ensureInventorySupport();
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    await connection.execute('INSERT IGNORE INTO material_categorias (nombre) VALUES (?)', [materialTipo]);
+    const categoryId = await resolveMaterialCategoryId(connection, id_categoria ?? categoria_id ?? categoria ?? tipo, materialTipo);
+    const finalCodigo = await generateMaterialCode(connection, categoryId ?? (id_categoria ?? categoria_id ?? categoria ?? tipo), materialTipo);
+
+    if (!nombre || !materialTipo || !unidadMedida) {
+      await connection.rollback();
+      return response.status(400).json({ message: 'Nombre, categoría y unidad son obligatorios.' });
+    }
+
+    if (shouldRegisterInventory && (!Number.isFinite(initialStock) || initialStock <= 0)) {
+      await connection.rollback();
+      return response.status(400).json({ message: 'La cantidad inicial debe ser mayor a cero.' });
+    }
+
     const [result] = await connection.execute(
-      'INSERT INTO materiales (codigo, nombre, tipo, rendimiento_m2_gal, precio_unitario, unidad_medida) VALUES (?, ?, ?, ?, ?, ?)',
-      [codigo, nombre, materialTipo, rendimientoMaterial, precioUnitario, unidadMedida]
+      'INSERT INTO materiales (id_usuario, id_categoria, codigo, nombre, tipo, rendimiento_m2_gal, precio_unitario, unidad_medida, descripcion) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [finalUserId, categoryId, finalCodigo, nombre, materialTipo, rendimientoMaterial, precioUnitario, unidadMedida, descripcion || null]
     );
     await connection.execute(
-      'INSERT INTO inventario (id_material, stock_actual, stock_minimo) VALUES (?, ?, ?)',
-      [result.insertId, shouldRegisterInventory ? initialStock : 0, stockMinimo]
+      'INSERT INTO inventario (id_usuario, id_material, stock_actual, stock_minimo) VALUES (?, ?, ?, ?)',
+      [finalUserId, result.insertId, shouldRegisterInventory ? initialStock : 0, stockMinimo]
     );
 
     if (shouldRegisterInventory) {
       await connection.execute(
-        'INSERT INTO movimientos_inventario (material_id, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, CURDATE(), ?, ?, ?)',
-        [result.insertId, 'Entrada', initialStock, referencia_inventario || 'Inventario inicial', 'Registro creado desde materiales']
+        'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
+        [result.insertId, finalUserId, 'Entrada', initialStock, referencia_inventario || 'Inventario inicial', 'Registro creado desde materiales']
       );
     }
 
@@ -863,27 +1002,37 @@ app.post('/api/materiales', async (request, response) => {
 });
 
 app.put('/api/materiales/:id', async (request, response) => {
-  const { codigo, nombre, categoria, tipo, unidad, unidad_medida, rendimiento, rendimiento_m2_gal, costo, precio_unitario, stock_minimo } = request.body;
+  const { codigo, nombre, categoria, tipo, unidad, unidad_medida, rendimiento, rendimiento_m2_gal, costo, precio_unitario, stock_minimo, descripcion, id_usuario, usuario_id, usuario, id_categoria, categoria_id } = request.body;
   const materialTipo = categoria || tipo;
   const unidadMedida = unidad || unidad_medida || 'Galón';
-  const rendimientoMaterial = rendimiento || rendimiento_m2_gal || 35;
+  const rendimientoMaterial = Number(rendimiento ?? rendimiento_m2_gal ?? 0);
   const precioUnitario = costo || precio_unitario || 0;
   const stockMinimo = stock_minimo || 0;
-
-  if (!codigo || !nombre || !materialTipo || !unidadMedida) {
-    return response.status(400).json({ message: 'Código, nombre, categoría y unidad son obligatorios.' });
-  }
+  const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
+  const finalUserId = id_usuario || usuario_id || usuario || sessionUserId || null;
 
   await ensureMaterialCategorySupport();
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    await connection.execute('INSERT IGNORE INTO material_categorias (nombre) VALUES (?)', [materialTipo]);
+    const [currentMaterial] = await connection.execute(
+      'SELECT codigo FROM materiales WHERE id_material = ? LIMIT 1',
+      [request.params.id]
+    );
+
+    const categoryId = await resolveMaterialCategoryId(connection, id_categoria ?? categoria_id ?? categoria ?? tipo, materialTipo);
+    const finalCodigo = currentMaterial[0]?.codigo || "";
+
+    if (!nombre || !materialTipo || !unidadMedida) {
+      await connection.rollback();
+      return response.status(400).json({ message: 'Nombre, categoría y unidad son obligatorios.' });
+    }
+
     const [result] = await connection.execute(
       `UPDATE materiales
-       SET codigo = ?, nombre = ?, tipo = ?, rendimiento_m2_gal = ?, precio_unitario = ?, unidad_medida = ?
+       SET id_usuario = ?, id_categoria = ?, codigo = ?, nombre = ?, tipo = ?, rendimiento_m2_gal = ?, precio_unitario = ?, unidad_medida = ?, descripcion = ?
        WHERE id_material = ?`,
-      [codigo, nombre, materialTipo, rendimientoMaterial, precioUnitario, unidadMedida, request.params.id]
+      [finalUserId, categoryId, finalCodigo, nombre, materialTipo, rendimientoMaterial, precioUnitario, unidadMedida, descripcion || null, request.params.id]
     );
     if (result.affectedRows === 0) {
       await connection.rollback();
@@ -891,14 +1040,14 @@ app.put('/api/materiales/:id', async (request, response) => {
     }
 
     const [inventoryResult] = await connection.execute(
-      'UPDATE inventario SET stock_minimo = ? WHERE id_material = ?',
-      [stockMinimo, request.params.id]
+      'UPDATE inventario SET id_usuario = ?, stock_minimo = ? WHERE id_material = ?',
+      [finalUserId, stockMinimo, request.params.id]
     );
 
     if (inventoryResult.affectedRows === 0) {
       await connection.execute(
-        'INSERT INTO inventario (id_material, stock_actual, stock_minimo) VALUES (?, 0, ?)',
-        [request.params.id, stockMinimo]
+        'INSERT INTO inventario (id_usuario, id_material, stock_actual, stock_minimo) VALUES (?, ?, 0, ?)',
+        [finalUserId, request.params.id, stockMinimo]
       );
     }
 
@@ -960,6 +1109,36 @@ app.get('/api/proyectos', async (_request, response) => {
   } catch (error) {
     console.error('Error al consultar proyectos:', error);
     response.status(500).json({ message: 'No fue posible consultar los proyectos.' });
+  }
+});
+
+app.get('/api/dashboard/summary', async (_request, response) => {
+  try {
+    await ensureProjectSupport();
+    await ensureInventorySupport();
+
+    const [clientesRows] = await pool.execute('SELECT COUNT(*) AS total FROM clientes');
+    const [proyectosRows] = await pool.execute('SELECT COUNT(*) AS total FROM proyectos');
+    const [materialesRows] = await pool.execute('SELECT COUNT(*) AS total FROM materiales');
+    const [alertasRows] = await pool.execute(`
+      SELECT COUNT(*) AS total
+      FROM inventario i
+      WHERE i.stock_actual <= i.stock_minimo
+    `);
+
+    response.json({
+      clientes: Number(clientesRows[0]?.total ?? 0),
+      proyectos: Number(proyectosRows[0]?.total ?? 0),
+      materiales: Number(materialesRows[0]?.total ?? 0),
+      alertas: Number(alertasRows[0]?.total ?? 0),
+      clientesLabel: 'Registros actuales',
+      proyectosLabel: 'En seguimiento',
+      materialesLabel: 'Disponibles',
+      alertasLabel: 'Requieren revisión'
+    });
+  } catch (error) {
+    console.error('Error al consultar resumen del dashboard:', error);
+    response.status(500).json({ message: 'No fue posible consultar el resumen del panel principal.' });
   }
 });
 
@@ -1028,9 +1207,11 @@ app.post('/api/proyectos/:id/materiales', async (request, response) => {
   try {
     await ensureProjectSupport();
     const projectId = Number(request.params.id);
-    const { id_material, cantidad, precio_unitario } = request.body || {};
+    const { id_material, cantidad, precio_unitario, id_usuario, usuario_id, usuario } = request.body || {};
     const materialId = Number(id_material ?? 0);
     const quantity = Number(cantidad ?? 0);
+    const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
+    const finalUserId = id_usuario || usuario_id || usuario || sessionUserId || null;
 
     if (!projectId || !materialId || !Number.isFinite(quantity) || quantity <= 0) {
       return response.status(400).json({ message: 'Material y cantidad válidos son obligatorios.' });
@@ -1049,9 +1230,9 @@ app.post('/api/proyectos/:id/materiales', async (request, response) => {
     const subtotal = Number((quantity * finalUnitPrice).toFixed(2));
 
     await pool.execute(
-      `INSERT INTO proyecto_materiales (id_proyecto, id_material, cantidad_calculada, costo_subtotal)
-       VALUES (?, ?, ?, ?)`,
-      [projectId, materialId, quantity, subtotal]
+      `INSERT INTO proyecto_materiales (id_usuario, id_proyecto, id_material, cantidad_calculada, costo_subtotal)
+       VALUES (?, ?, ?, ?, ?)`,
+      [finalUserId, projectId, materialId, quantity, subtotal]
     );
 
     await syncProjectMaterialSummary(pool, projectId);
