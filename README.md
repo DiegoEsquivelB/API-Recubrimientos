@@ -1,45 +1,118 @@
-# API-Proyecto
+# API Proyecto G2
 
-Backend REST del sistema de recubrimientos arquitectónicos.
+Backend REST del sistema de gestión para recubrimientos arquitectónicos.
 
 ## Requisitos
 
 - Node.js 18 o superior
 - MySQL 8 o superior
+- Base de datos con nombre `recubrimientos`
 
 ## Instalación
 
 ```powershell
-cd API-Proyecto
+cd "API-ProyectoG2"
 npm install
 Copy-Item .env.example .env
 ```
 
-Edite `.env` con los datos de su servidor MySQL y ejecute `database/schema.sql` desde MySQL Workbench o la consola de MySQL.
+Configure el archivo `.env` con la conexión a MySQL:
 
-Para iniciar:
+```env
+PORT=3000
+DB_HOST=localhost
+DB_PORT=3306
+DB_NAME=recubrimientos
+DB_USER=root
+DB_PASSWORD=root
+```
+
+Luego importe el esquema si aún no existe:
+
+```powershell
+mysql -u root -p < database\schema.sql
+```
+
+O puede ejecutarlo desde MySQL Workbench.
+
+## Ejecutar la API
 
 ```powershell
 npm run dev
 ```
 
-La API quedará disponible en `http://localhost:3000`.
+La API queda disponible en:
 
-## Rutas
+- `http://localhost:3000`
+- `http://localhost:3000/api/health`
 
+## Funcionalidades principales
+
+- Autenticación de usuarios
+- Gestión de clientes
+- Gestión de materiales e inventario
+- Cálculo de materiales por proyecto
+- CRUD de proyectos
+- Reportes y panel principal
+
+## Rutas principales
+
+### Autenticación
 - `GET /api/health`
 - `POST /api/auth/login`
+- `GET /api/auth/session`
+- `GET /api/auth/me`
+- `POST /api/auth/logout`
 - `POST /api/auth/usuarios`
-- `GET|POST /api/clientes`
-- `GET|PUT|DELETE /api/clientes/:id`
-- `GET|POST /api/materiales`
-- `GET|PUT|DELETE /api/materiales/:id`
-- `GET|POST /api/proyectos`
-- `GET|PUT|DELETE /api/proyectos/:id`
-- `GET|POST /api/inventario/movimientos`
-- `GET|PUT|DELETE /api/inventario/movimientos/:id`
 
+### Usuarios
+- `GET /api/usuarios`
+- `GET /api/usuarios/:id`
+- `POST /api/usuarios`
+- `PUT /api/usuarios/:id`
+- `DELETE /api/usuarios/:id`
 
-## Usuario Predeterminado
-Usuario: admin@recubrimientos.com
-Contraseña: admin123
+### Clientes
+- `GET /api/clientes`
+- `GET /api/clientes/:id`
+- `POST /api/clientes`
+- `PUT /api/clientes/:id`
+- `DELETE /api/clientes/:id`
+
+### Materiales
+- `GET /api/materiales`
+- `GET /api/materiales/:id`
+- `POST /api/materiales`
+- `PUT /api/materiales/:id`
+- `DELETE /api/materiales/:id`
+- `GET /api/materiales/categorias`
+- `POST /api/materiales/categorias`
+- `PUT /api/materiales/categorias/:id`
+- `DELETE /api/materiales/categorias/:id`
+
+### Proyectos
+- `GET /api/proyectos`
+- `GET /api/proyectos/:id`
+- `POST /api/proyectos`
+- `PUT /api/proyectos/:id`
+- `DELETE /api/proyectos/:id`
+
+> La API incluye una validación de compatibilidad del esquema para agregar la columna `id_usuario` en `proyectos` cuando la instalación existente la carece.
+
+### Inventario
+- `GET /api/inventario`
+- `GET /api/inventario/movimientos`
+- `POST /api/inventario/movimientos`
+- `PUT /api/inventario/movimientos/:id`
+- `DELETE /api/inventario/movimientos/:id`
+
+## Usuario predeterminado
+
+- Usuario: `admin@recubrimientos.com`
+- Contraseña: `admin123`
+
+## Notas
+
+- La API usa cookies de sesión para autenticación.
+- El backend exige sesión válida para acceder a rutas protegidas dentro de `/api`.
+- El frontend se conecta automáticamente a `http://localhost:3000/api` desde la UI web.

@@ -87,6 +87,15 @@ function getSessionFromRequest(request) {
   return verifySessionToken(cookies[sessionCookieName]);
 }
 
+function resolveProjectUserId(request, requestUserId) {
+  if (requestUserId !== undefined && requestUserId !== null && requestUserId !== '') {
+    return requestUserId;
+  }
+
+  const session = getSessionFromRequest(request);
+  return session ? session.sub : null;
+}
+
 function sessionCookieOptions(remember = false) {
   return {
     httpOnly: true,
@@ -187,6 +196,106 @@ async function ensureInventorySupport() {
   } catch (_error) {
     // Existing installations can still work if the DB user cannot alter column metadata.
   }
+}
+
+async function ensureProjectSupport() {
+  const [existingColumns] = await pool.query(`
+    SELECT COLUMN_NAME
+    FROM information_schema.columns
+    WHERE table_schema = DATABASE()
+      AND table_name = 'proyectos'
+  `);
+
+  const columnNames = new Set(existingColumns.map((column) => column.COLUMN_NAME));
+
+  if (!columnNames.has('id_usuario')) {
+    await pool.query('ALTER TABLE proyectos ADD COLUMN id_usuario INT NULL AFTER id_cliente');
+  }
+
+  const projectColumnsToAdd = [
+    ['largo', 'DECIMAL(10,2) NULL AFTER nombre_proyecto'],
+    ['altura', 'DECIMAL(10,2) NULL AFTER area_m2'],
+    ['tipo', 'VARCHAR(80) NULL AFTER altura'],
+    ['descripcion', 'TEXT NULL AFTER tipo']
+  ];
+
+  for (const [columnName, definition] of projectColumnsToAdd) {
+    if (!columnNames.has(columnName)) {
+      await pool.query(`ALTER TABLE proyectos ADD COLUMN ${columnName} ${definition}`);
+    }
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS proyecto_materiales (
+      id_detalle INT AUTO_INCREMENT PRIMARY KEY,
+      id_proyecto INT NOT NULL,
+      id_material INT NOT NULL,
+      cantidad_calculada DECIMAL(10,2) NOT NULL,
+      costo_subtotal DECIMAL(10,2) NOT NULL,
+      FOREIGN KEY (id_proyecto) REFERENCES proyectos(id_proyecto) ON DELETE CASCADE,
+      FOREIGN KEY (id_material) REFERENCES materiales(id_material)
+    )
+  `);
+
+  try {
+    await pool.query(`
+      ALTER TABLE proyectos
+      ADD CONSTRAINT fk_proyectos_usuarios
+      FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE SET NULL
+    `);
+  } catch (_error) {
+    // The foreign key may already exist.
+  }
+}
+
+async function syncProjectMaterialSummary(connection, projectId) {
+  const [summaryRows] = await connection.execute(`
+    SELECT COALESCE(SUM(costo_subtotal), 0) AS total
+    FROM proyecto_materiales
+    WHERE id_proyecto = ?
+  `, [projectId]);
+
+  const total = Number(summaryRows[0]?.total ?? 0);
+  await connection.execute(
+    'UPDATE proyectos SET costo_estimado = ? WHERE id_proyecto = ?',
+    [total, projectId]
+  );
+
+  return total;
+}
+
+async function upsertProjectMaterialRelations(connection, projectId, materiales = []) {
+  const items = Array.isArray(materiales) ? materiales : [];
+  await connection.execute('DELETE FROM proyecto_materiales WHERE id_proyecto = ?', [projectId]);
+
+  for (const item of items) {
+    const materialId = Number(item.id_material ?? item.id ?? item.material_id ?? 0);
+    const cantidad = Number(item.cantidad ?? item.cantidad_calculada ?? item.qty ?? 0);
+
+    if (!materialId || !Number.isFinite(cantidad) || cantidad <= 0) {
+      continue;
+    }
+
+    const [materialRows] = await connection.execute(
+      'SELECT precio_unitario FROM materiales WHERE id_material = ? LIMIT 1',
+      [materialId]
+    );
+
+    if (!materialRows[0]) {
+      continue;
+    }
+
+    const precioUnitario = Number(item.precio_unitario ?? materialRows[0].precio_unitario ?? 0);
+    const subtotal = Number((cantidad * precioUnitario).toFixed(2));
+
+    await connection.execute(
+      `INSERT INTO proyecto_materiales (id_proyecto, id_material, cantidad_calculada, costo_subtotal)
+       VALUES (?, ?, ?, ?)`,
+      [projectId, materialId, cantidad, subtotal]
+    );
+  }
+
+  await syncProjectMaterialSummary(connection, projectId);
 }
 
 async function applyInventoryDelta(connection, materialId, tipo, cantidad, direction = 1) {
@@ -823,56 +932,279 @@ app.delete('/api/materiales/:id', async (request, response) => {
 
 app.get('/api/proyectos', async (_request, response) => {
   try {
+    await ensureProjectSupport();
     const [rows] = await pool.query(`
-      SELECT p.*, c.nombre AS cliente_nombre
-      FROM proyectos p INNER JOIN clientes c ON c.id = p.cliente_id
-      ORDER BY p.id DESC
+      SELECT
+        p.id_proyecto AS id,
+        p.id_proyecto,
+        p.id_cliente,
+        COALESCE(p.id_usuario, 0) AS id_usuario,
+        p.nombre_proyecto AS nombre,
+        p.nombre_proyecto,
+        COALESCE(p.largo, p.area_m2) AS largo,
+        p.area_m2,
+        p.altura,
+        p.tipo,
+        p.descripcion,
+        p.estado,
+        p.costo_estimado AS presupuesto,
+        p.costo_estimado,
+        p.fecha_inicio,
+        p.fecha_creacion,
+        c.nombre AS cliente_nombre
+      FROM proyectos p
+      LEFT JOIN clientes c ON c.id_cliente = p.id_cliente
+      ORDER BY p.id_proyecto DESC
     `);
     response.json(rows);
-  } catch (_error) {
+  } catch (error) {
+    console.error('Error al consultar proyectos:', error);
     response.status(500).json({ message: 'No fue posible consultar los proyectos.' });
   }
 });
 
 app.get('/api/proyectos/:id', async (request, response) => {
   try {
+    await ensureProjectSupport();
     const [rows] = await pool.execute(`
-      SELECT p.*, c.nombre AS cliente_nombre
-      FROM proyectos p INNER JOIN clientes c ON c.id = p.cliente_id
-      WHERE p.id = ?`, [request.params.id]);
+      SELECT
+        p.id_proyecto AS id,
+        p.id_proyecto,
+        p.id_cliente,
+        COALESCE(p.id_usuario, 0) AS id_usuario,
+        p.nombre_proyecto AS nombre,
+        p.nombre_proyecto,
+        COALESCE(p.largo, p.area_m2) AS largo,
+        p.area_m2,
+        p.altura,
+        p.tipo,
+        p.descripcion,
+        p.estado,
+        p.costo_estimado AS presupuesto,
+        p.costo_estimado,
+        p.fecha_inicio,
+        p.fecha_creacion,
+        c.nombre AS cliente_nombre
+      FROM proyectos p
+      LEFT JOIN clientes c ON c.id_cliente = p.id_cliente
+      WHERE p.id_proyecto = ?`, [request.params.id]);
     if (!rows[0]) return response.status(404).json({ message: 'Proyecto no encontrado.' });
-    response.json(rows[0]);
-  } catch (_error) {
+
+    const [materialRows] = await pool.execute(`
+      SELECT pm.id_detalle, pm.id_material, m.nombre AS material_nombre, pm.cantidad_calculada, pm.costo_subtotal, m.precio_unitario
+      FROM proyecto_materiales pm
+      JOIN materiales m ON m.id_material = pm.id_material
+      WHERE pm.id_proyecto = ?
+      ORDER BY pm.id_detalle ASC
+    `, [request.params.id]);
+
+    const project = rows[0];
+    project.materiales = materialRows;
+    response.json(project);
+  } catch (error) {
+    console.error('Error al consultar proyecto por id:', error);
     response.status(500).json({ message: 'No fue posible consultar el proyecto.' });
   }
 });
 
+app.get('/api/proyectos/:id/materiales', async (request, response) => {
+  try {
+    await ensureProjectSupport();
+    const [rows] = await pool.execute(`
+      SELECT pm.id_detalle, pm.id_material, m.nombre AS material_nombre, pm.cantidad_calculada, pm.costo_subtotal, m.precio_unitario
+      FROM proyecto_materiales pm
+      JOIN materiales m ON m.id_material = pm.id_material
+      WHERE pm.id_proyecto = ?
+      ORDER BY pm.id_detalle ASC
+    `, [request.params.id]);
+
+    response.json(rows);
+  } catch (error) {
+    response.status(500).json({ message: 'No fue posible consultar los materiales del proyecto.' });
+  }
+});
+
+app.post('/api/proyectos/:id/materiales', async (request, response) => {
+  try {
+    await ensureProjectSupport();
+    const projectId = Number(request.params.id);
+    const { id_material, cantidad, precio_unitario } = request.body || {};
+    const materialId = Number(id_material ?? 0);
+    const quantity = Number(cantidad ?? 0);
+
+    if (!projectId || !materialId || !Number.isFinite(quantity) || quantity <= 0) {
+      return response.status(400).json({ message: 'Material y cantidad válidos son obligatorios.' });
+    }
+
+    const [materialRows] = await pool.execute(
+      'SELECT precio_unitario FROM materiales WHERE id_material = ? LIMIT 1',
+      [materialId]
+    );
+
+    if (!materialRows[0]) {
+      return response.status(404).json({ message: 'Material no encontrado.' });
+    }
+
+    const finalUnitPrice = Number(precio_unitario ?? materialRows[0].precio_unitario ?? 0);
+    const subtotal = Number((quantity * finalUnitPrice).toFixed(2));
+
+    await pool.execute(
+      `INSERT INTO proyecto_materiales (id_proyecto, id_material, cantidad_calculada, costo_subtotal)
+       VALUES (?, ?, ?, ?)`,
+      [projectId, materialId, quantity, subtotal]
+    );
+
+    await syncProjectMaterialSummary(pool, projectId);
+    response.status(201).json({ message: 'Material agregado al proyecto correctamente.' });
+  } catch (_error) {
+    response.status(500).json({ message: 'No fue posible guardar el material del proyecto.' });
+  }
+});
+
+app.delete('/api/proyectos/:id/materiales/:detalleId', async (request, response) => {
+  try {
+    await ensureProjectSupport();
+    const [result] = await pool.execute(
+      'DELETE FROM proyecto_materiales WHERE id_proyecto = ? AND id_detalle = ?',
+      [request.params.id, request.params.detalleId]
+    );
+
+    if (result.affectedRows === 0) {
+      return response.status(404).json({ message: 'Material del proyecto no encontrado.' });
+    }
+
+    await syncProjectMaterialSummary(pool, Number(request.params.id));
+    response.json({ message: 'Material del proyecto eliminado correctamente.' });
+  } catch (_error) {
+    response.status(500).json({ message: 'No fue posible eliminar el material del proyecto.' });
+  }
+});
+
+function normalizeProjectDate(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  const rawValue = String(value).trim();
+  if (!rawValue) return null;
+
+  const isoDateMatch = rawValue.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoDateMatch) {
+    return rawValue;
+  }
+
+  const europeanDateMatch = rawValue.match(/^(\d{2})[-/](\d{2})[-/](\d{4})$/);
+  if (europeanDateMatch) {
+    const [, day, month, year] = europeanDateMatch;
+    return `${year}-${month}-${day}`;
+  }
+
+  const isoDateWithTimeMatch = rawValue.match(/^(\d{4})-(\d{2})-(\d{2})T.*$/);
+  if (isoDateWithTimeMatch) {
+    return `${isoDateWithTimeMatch[1]}-${isoDateWithTimeMatch[2]}-${isoDateWithTimeMatch[3]}`;
+  }
+
+  const parsedDate = new Date(rawValue);
+  if (!Number.isNaN(parsedDate.getTime())) {
+    const localDate = new Date(parsedDate.getTime() - (parsedDate.getTimezoneOffset() * 60000));
+    return localDate.toISOString().slice(0, 10);
+  }
+
+  return rawValue;
+}
+
 app.post('/api/proyectos', async (request, response) => {
-  const { nombre, cliente_id, estado, fecha_inicio, fecha_fin, largo, ancho, altura, tipo, presupuesto, notas } = request.body;
-  if (!nombre || !cliente_id || !largo || !ancho) return response.status(400).json({ message: 'Nombre, cliente, largo y ancho son obligatorios.' });
+  await ensureProjectSupport();
+  const { nombre, nombre_proyecto, id_cliente, cliente_id, id_usuario, usuario_id, estado, fecha_inicio, fechaInicio, largo, area_m2, altura, tipo, presupuesto, costo_estimado, descripcion, materiales } = request.body;
+  const finalNombre = nombre || nombre_proyecto;
+  const finalClienteId = id_cliente || cliente_id;
+  const finalUsuarioId = resolveProjectUserId(request, id_usuario || usuario_id);
+  const finalFechaInicio = normalizeProjectDate(fecha_inicio ?? fechaInicio ?? null);
+  const finalLargo = Number(largo ?? 0);
+  const finalPresupuesto = presupuesto ?? costo_estimado ?? 0;
+  const finalArea = area_m2 ?? (finalLargo && altura ? Number(finalLargo) * Number(altura) : 0);
+  const finalDescripcion = descripcion ?? null;
+  const finalEstado = 'Pendiente';
+
+  if (!finalNombre || !finalClienteId || !finalUsuarioId || !finalLargo || !finalArea) {
+    return response.status(400).json({ message: 'Nombre, cliente, usuario, largo y área son obligatorios.' });
+  }
+
   try {
     const [result] = await pool.execute(
-      `INSERT INTO proyectos (nombre, cliente_id, estado, fecha_inicio, fecha_fin, largo, ancho, altura, tipo, presupuesto, notas)
+      `INSERT INTO proyectos (id_cliente, id_usuario, nombre_proyecto, largo, area_m2, altura, tipo, estado, costo_estimado, fecha_inicio, descripcion)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [nombre, cliente_id, estado || 'Pendiente', fecha_inicio || null, fecha_fin || null, largo, ancho, altura || 0, tipo || null, presupuesto || 0, notas || null]
+      [finalClienteId, finalUsuarioId, finalNombre, finalLargo || null, finalArea, altura ?? null, tipo || null, finalEstado, finalPresupuesto || 0, finalFechaInicio || null, finalDescripcion || null]
     );
-    response.status(201).json({ id: result.insertId, message: 'Proyecto guardado correctamente.' });
+
+    const projectId = Number(result.insertId);
+    if (Array.isArray(materiales) && materiales.length) {
+      await upsertProjectMaterialRelations(pool, projectId, materiales);
+    }
+
+    response.status(201).json({ id: projectId, id_proyecto: projectId, message: 'Proyecto guardado correctamente.' });
   } catch (_error) {
     response.status(500).json({ message: 'No fue posible guardar el proyecto.' });
   }
 });
 
 app.put('/api/proyectos/:id', async (request, response) => {
-  const { nombre, cliente_id, estado, fecha_inicio, fecha_fin, largo, ancho, altura, tipo, presupuesto, notas } = request.body;
-  if (!nombre || !cliente_id || !largo || !ancho) return response.status(400).json({ message: 'Nombre, cliente, largo y ancho son obligatorios.' });
+  await ensureProjectSupport();
+
   try {
+    const [existingRows] = await pool.execute(`
+      SELECT *
+      FROM proyectos
+      WHERE id_proyecto = ?
+    `, [request.params.id]);
+
+    if (!existingRows[0]) {
+      return response.status(404).json({ message: 'Proyecto no encontrado.' });
+    }
+
+    const currentProject = existingRows[0];
+    const incoming = request.body || {};
+    const merged = {
+      ...currentProject,
+      ...incoming,
+      nombre_proyecto: incoming.nombre_proyecto ?? incoming.nombre ?? currentProject.nombre_proyecto,
+      id_cliente: incoming.id_cliente ?? incoming.cliente_id ?? currentProject.id_cliente,
+      id_usuario: incoming.id_usuario ?? incoming.usuario_id ?? currentProject.id_usuario,
+      fecha_inicio: incoming.fecha_inicio ?? incoming.fechaInicio ?? currentProject.fecha_inicio,
+      largo: incoming.largo ?? currentProject.largo,
+      area_m2: incoming.area_m2 ?? currentProject.area_m2,
+      altura: incoming.altura ?? currentProject.altura,
+      tipo: incoming.tipo ?? currentProject.tipo,
+      costo_estimado: incoming.costo_estimado ?? incoming.presupuesto ?? currentProject.costo_estimado,
+      descripcion: incoming.descripcion ?? currentProject.descripcion,
+      estado: incoming.estado ?? currentProject.estado ?? 'Pendiente'
+    };
+
+    const finalNombre = merged.nombre_proyecto || merged.nombre;
+    const finalClienteId = merged.id_cliente;
+    const finalUsuarioId = resolveProjectUserId(request, merged.id_usuario);
+    const finalFechaInicio = normalizeProjectDate(merged.fecha_inicio ?? null);
+    const finalLargo = Number(merged.largo ?? 0);
+    const finalPresupuesto = merged.costo_estimado ?? 0;
+    const finalArea = merged.area_m2 ?? (finalLargo && merged.altura ? Number(finalLargo) * Number(merged.altura) : 0);
+    const finalDescripcion = merged.descripcion ?? null;
+    const finalEstado = merged.estado || 'Pendiente';
+
+    if (!finalNombre || !finalClienteId || !finalUsuarioId || !finalLargo || !finalArea) {
+      return response.status(400).json({ message: 'Nombre, cliente, usuario, largo y área son obligatorios.' });
+    }
+
     const [result] = await pool.execute(
       `UPDATE proyectos
-       SET nombre = ?, cliente_id = ?, estado = ?, fecha_inicio = ?, fecha_fin = ?, largo = ?, ancho = ?, altura = ?, tipo = ?, presupuesto = ?, notas = ?
-       WHERE id = ?`,
-      [nombre, cliente_id, estado || 'Pendiente', fecha_inicio || null, fecha_fin || null, largo, ancho, altura || 0, tipo || null, presupuesto || 0, notas || null, request.params.id]
+       SET id_cliente = ?, id_usuario = ?, nombre_proyecto = ?, largo = ?, area_m2 = ?, altura = ?, tipo = ?, estado = ?, costo_estimado = ?, fecha_inicio = ?, descripcion = ?
+       WHERE id_proyecto = ?`,
+      [finalClienteId, finalUsuarioId, finalNombre, finalLargo || null, finalArea, merged.altura ?? null, merged.tipo || null, finalEstado, finalPresupuesto || 0, finalFechaInicio || null, finalDescripcion || null, request.params.id]
     );
+
     if (result.affectedRows === 0) return response.status(404).json({ message: 'Proyecto no encontrado.' });
+
+    if (Array.isArray(request.body.materiales) && request.body.materiales.length) {
+      await upsertProjectMaterialRelations(pool, Number(request.params.id), request.body.materiales);
+    }
+
     response.json({ message: 'Proyecto actualizado correctamente.' });
   } catch (_error) {
     response.status(500).json({ message: 'No fue posible actualizar el proyecto.' });
@@ -881,7 +1213,7 @@ app.put('/api/proyectos/:id', async (request, response) => {
 
 app.delete('/api/proyectos/:id', async (request, response) => {
   try {
-    const [result] = await pool.execute('DELETE FROM proyectos WHERE id = ?', [request.params.id]);
+    const [result] = await pool.execute('DELETE FROM proyectos WHERE id_proyecto = ?', [request.params.id]);
     if (result.affectedRows === 0) return response.status(404).json({ message: 'Proyecto no encontrado.' });
     response.json({ message: 'Proyecto eliminado correctamente.' });
   } catch (_error) {
