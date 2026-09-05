@@ -217,6 +217,14 @@ function requireAuth(request, response, next) {
   next();
 }
 
+function requireAdministrator(request, response, next) {
+  if (request.user?.rol !== 'Administrador') {
+    return response.status(403).json({ message: 'No tiene permisos para administrar usuarios.' });
+  }
+
+  next();
+}
+
 async function ensureDefaultAdminUser() {
   await pool.execute(
     `INSERT IGNORE INTO usuarios (nombre, email, password_hash, rol, estado)
@@ -229,6 +237,25 @@ async function ensureDefaultAdminUser() {
       'Activo'
     ]
   );
+}
+
+async function ensureUserDeleteAuditTrigger() {
+  await pool.query('DROP TRIGGER IF EXISTS trg_aud_usuarios_delete');
+  await pool.query(`
+    CREATE TRIGGER trg_aud_usuarios_delete
+    AFTER DELETE ON usuarios
+    FOR EACH ROW
+    BEGIN
+      INSERT INTO auditoria_operaciones (modulo, accion, id_registro, usuario_responsable, detalle)
+      VALUES (
+        'autenticacion',
+        'DELETE',
+        OLD.id_usuario,
+        @usuario_responsable,
+        CONCAT('Usuario eliminado: nombre=', OLD.nombre, ', email=', OLD.email)
+      );
+    END
+  `);
 }
 
 const DEFAULT_MATERIAL_CATEGORIES = ['Pintura', 'Sellador', 'Esmalte', 'Impermeabilizante', 'Accesorio'];
@@ -381,9 +408,23 @@ async function syncProjectMaterialSummary(connection, projectId) {
   return total;
 }
 
-async function upsertProjectMaterialRelations(connection, projectId, materiales = []) {
+async function upsertProjectMaterialRelations(connection, projectId, materiales = [], userId = null) {
   const items = Array.isArray(materiales) ? materiales : [];
+  const [projectRows] = await connection.execute('SELECT nombre_proyecto FROM proyectos WHERE id_proyecto = ? LIMIT 1', [projectId]);
+  const projectName = projectRows[0]?.nombre_proyecto || `#${projectId}`;
+  const [previousRows] = await connection.execute(
+    'SELECT id_material, cantidad_calculada FROM proyecto_materiales WHERE id_proyecto = ?',
+    [projectId]
+  );
   await connection.execute('DELETE FROM proyecto_materiales WHERE id_proyecto = ?', [projectId]);
+
+  for (const previous of previousRows) {
+    await applyInventoryDelta(connection, previous.id_material, 'Entrada', previous.cantidad_calculada);
+    await connection.execute(
+      'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
+      [previous.id_material, userId, 'Entrada', previous.cantidad_calculada, `Reversión proyecto: ${projectName}`, 'Material retirado de la asignación del proyecto']
+    );
+  }
 
   for (const item of items) {
     const materialId = Number(item.id_material ?? item.id ?? item.material_id ?? 0);
@@ -404,6 +445,12 @@ async function upsertProjectMaterialRelations(connection, projectId, materiales 
 
     const precioUnitario = Number(item.precio_unitario ?? materialRows[0].precio_unitario ?? 0);
     const subtotal = Number((cantidad * precioUnitario).toFixed(2));
+
+    await applyInventoryDelta(connection, materialId, 'Salida', cantidad);
+    await connection.execute(
+      'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
+      [materialId, userId, 'Salida', cantidad, `Proyecto: ${projectName}`, 'Material asignado al proyecto']
+    );
 
     await connection.execute(
       `INSERT INTO proyecto_materiales (id_proyecto, id_material, cantidad_calculada, costo_subtotal)
@@ -582,11 +629,17 @@ app.post('/api/auth/logout', (_request, response) => {
 });
 
 app.use('/api', requireAuth);
+app.use(['/api/usuarios', '/api/auth/usuarios'], requireAdministrator);
 
 async function crearUsuario(request, response) {
   const { nombre, usuario, email, contrasena, rol = 'Operador' } = request.body;
-  const userEmail = email || usuario;
-  if (!nombre || !usuario || !contrasena) return response.status(400).json({ message: 'Nombre, usuario y contraseña son obligatorios.' });
+  const userEmail = String(email || '').trim();
+  if (!nombre || !userEmail || !contrasena) {
+    return response.status(400).json({
+      message: 'Nombre, correo electrónico y contraseña son obligatorios.',
+      errors: !userEmail ? { correo: 'El correo electrónico es obligatorio.' } : undefined
+    });
+  }
   try {
     const hash = await bcrypt.hash(contrasena, 12);
     const [result] = await pool.execute(
@@ -595,7 +648,11 @@ async function crearUsuario(request, response) {
     );
     response.status(201).json({ id: result.insertId, id_usuario: result.insertId, message: 'Usuario creado correctamente.' });
   } catch (error) {
-    response.status(error.code === 'ER_DUP_ENTRY' ? 409 : 500).json({ message: 'No fue posible crear el usuario.' });
+    const isDuplicateEmail = error.code === 'ER_DUP_ENTRY';
+    response.status(isDuplicateEmail ? 409 : 500).json({
+      message: isDuplicateEmail ? 'El correo electrónico ya está registrado.' : 'No fue posible crear el usuario.',
+      ...(isDuplicateEmail ? { errors: { correo: 'Este correo electrónico ya existe en la base de datos.' } } : {})
+    });
   }
 }
 
@@ -653,6 +710,12 @@ app.put('/api/usuarios/:id', async (request, response) => {
   if (!nombre || !userEmail) {
     return response.status(400).json({ message: 'Nombre y correo son obligatorios.' });
   }
+  if (!['Activo', 'Inactivo'].includes(estado)) {
+    return response.status(400).json({ message: 'El estado debe ser Activo o Inactivo.' });
+  }
+  if (Number(request.user?.sub) === Number(request.params.id) && estado === 'Inactivo') {
+    return response.status(409).json({ message: 'No puede desactivar el usuario con el que inició sesión.' });
+  }
 
   try {
     const updateValues = [nombre, userEmail, rol, estado, request.params.id];
@@ -695,12 +758,46 @@ app.put('/api/usuarios/:id', async (request, response) => {
 });
 
 app.delete('/api/usuarios/:id', async (request, response) => {
+  const connection = await pool.getConnection();
   try {
-    const [result] = await pool.execute('DELETE FROM usuarios WHERE id_usuario = ?', [request.params.id]);
-    if (result.affectedRows === 0) return response.status(404).json({ message: 'Usuario no encontrado.' });
+    await ensureUserDeleteAuditTrigger();
+    if (Number(request.user?.sub) === Number(request.params.id)) {
+      connection.release();
+      return response.status(409).json({ message: 'No puede eliminar el usuario con el que inició sesión.' });
+    }
+
+    await connection.beginTransaction();
+    await connection.execute('SET @usuario_responsable = ?', [request.user.sub]);
+    const [projectRows] = await connection.execute(
+      'SELECT COUNT(*) AS total FROM proyectos WHERE id_usuario = ?',
+      [request.params.id]
+    );
+    if (Number(projectRows[0]?.total || 0) > 0) {
+      await connection.rollback();
+      connection.release();
+      return response.status(409).json({
+        message: 'No se puede eliminar este usuario porque tiene proyectos asociados. Puede cambiar su estado a Inactivo.'
+      });
+    }
+
+    const [result] = await connection.execute('DELETE FROM usuarios WHERE id_usuario = ?', [request.params.id]);
+    if (result.affectedRows === 0) {
+      await connection.rollback();
+      connection.release();
+      return response.status(404).json({ message: 'Usuario no encontrado.' });
+    }
+    await connection.commit();
+    connection.release();
     response.json({ message: 'Usuario eliminado correctamente.' });
-  } catch (_error) {
-    response.status(500).json({ message: 'No fue posible eliminar el usuario.' });
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    const isReferencedUser = error.code === 'ER_ROW_IS_REFERENCED_2' || error.code === 'ER_ROW_IS_REFERENCED';
+    response.status(isReferencedUser ? 409 : 500).json({
+      message: isReferencedUser
+        ? 'No se puede eliminar este usuario porque tiene registros asociados. Puede cambiar su estado a Inactivo.'
+        : 'No fue posible eliminar el usuario.'
+    });
   }
 });
 
@@ -945,7 +1042,7 @@ app.post('/api/materiales', async (request, response) => {
   const stockMinimo = stock_minimo || 0;
   const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
   const finalUserId = id_usuario || usuario_id || usuario || sessionUserId || null;
-  const shouldRegisterInventory = ['1', 'true', 'on', true, 1].includes(registrar_inventario);
+  const shouldRegisterInventory = true;
   const initialStock = Number(stock_inicial || 0);
 
   await ensureMaterialCategorySupport();
@@ -1142,6 +1239,58 @@ app.get('/api/dashboard/summary', async (_request, response) => {
   }
 });
 
+app.get('/api/reportes', async (request, response) => {
+  const { tipo, desde, hasta, estado } = request.query;
+  const definitions = {
+    'Clientes registrados': {
+      columns: ['ID', 'Nombre', 'Identificación', 'Teléfono', 'Correo', 'Dirección', 'Fecha de registro'],
+      sql: 'SELECT id_cliente, nombre, identificacion, telefono, correo, direccion, fecha_registro FROM clientes WHERE 1 = 1',
+      dateColumn: 'fecha_registro'
+    },
+    'Proyectos por estado': {
+      columns: ['ID', 'Proyecto', 'Cliente', 'Estado', 'Área (m²)', 'Costo estimado', 'Fecha de inicio'],
+      sql: 'SELECT p.id_proyecto, p.nombre_proyecto, c.nombre AS cliente, p.estado, p.area_m2, p.costo_estimado, p.fecha_inicio FROM proyectos p JOIN clientes c ON c.id_cliente = p.id_cliente WHERE 1 = 1',
+      dateColumn: 'p.fecha_inicio'
+    },
+    'Inventario actual': {
+      columns: ['ID', 'Código', 'Material', 'Unidad', 'Existencia', 'Mínimo', 'Estado'],
+      sql: "SELECT i.id_inventario, m.codigo, m.nombre, m.unidad_medida, i.stock_actual, i.stock_minimo, CASE WHEN i.stock_actual <= i.stock_minimo THEN 'Stock mínimo' ELSE 'Existencia normal' END AS estado FROM inventario i JOIN materiales m ON m.id_material = i.id_material WHERE 1 = 1"
+    },
+    'Movimientos de inventario': {
+      columns: ['ID', 'Material', 'Tipo', 'Fecha', 'Cantidad', 'Referencia', 'Notas'],
+      sql: 'SELECT mi.id_movimiento, m.nombre, mi.tipo, mi.fecha, mi.cantidad, mi.referencia, mi.notas FROM movimientos_inventario mi JOIN materiales m ON m.id_material = mi.material_id WHERE 1 = 1',
+      dateColumn: 'mi.fecha'
+    },
+    'Consumo de materiales': {
+      columns: ['Material', 'Código', 'Cantidad consumida', 'Costo total'],
+      sql: 'SELECT m.nombre, m.codigo, SUM(pm.cantidad_calculada) AS cantidad_consumida, SUM(pm.costo_subtotal) AS costo_total FROM proyecto_materiales pm JOIN materiales m ON m.id_material = pm.id_material JOIN proyectos p ON p.id_proyecto = pm.id_proyecto WHERE 1 = 1 GROUP BY pm.id_material, m.nombre, m.codigo',
+      dateColumn: 'p.fecha_inicio'
+    }
+  };
+  const definition = definitions[tipo];
+  if (!definition) return response.status(400).json({ message: 'Tipo de reporte no válido.' });
+  if (desde && !/^\d{4}-\d{2}-\d{2}$/.test(desde)) return response.status(400).json({ message: 'La fecha inicial no es válida.' });
+  if (hasta && !/^\d{4}-\d{2}-\d{2}$/.test(hasta)) return response.status(400).json({ message: 'La fecha final no es válida.' });
+  if (desde && hasta && desde > hasta) return response.status(400).json({ message: 'La fecha inicial no puede ser posterior a la fecha final.' });
+
+  const parameters = [];
+  let sql = definition.sql;
+  if (definition.dateColumn && desde) { sql += ` AND ${definition.dateColumn} >= ?`; parameters.push(desde); }
+  if (definition.dateColumn && hasta) { sql += ` AND ${definition.dateColumn} < DATE_ADD(?, INTERVAL 1 DAY)`; parameters.push(hasta); }
+  if (tipo === 'Proyectos por estado' && estado) { sql += ' AND p.estado = ?'; parameters.push(estado); }
+  sql += tipo === 'Consumo de materiales' ? ' ORDER BY cantidad_consumida DESC' : ' ORDER BY 1 DESC';
+
+  try {
+    if (tipo.toLowerCase().includes('inventario')) await ensureInventorySupport();
+    if (tipo.includes('Proyectos') || tipo === 'Consumo de materiales') await ensureProjectSupport();
+    const [rows] = await pool.execute(sql, parameters);
+    response.json({ tipo, columnas: definition.columns, filas: rows, total: rows.length });
+  } catch (error) {
+    console.error('Error al generar reporte:', error);
+    response.status(500).json({ message: 'No fue posible generar el reporte.' });
+  }
+});
+
 app.get('/api/proyectos/:id', async (request, response) => {
   try {
     await ensureProjectSupport();
@@ -1204,6 +1353,7 @@ app.get('/api/proyectos/:id/materiales', async (request, response) => {
 });
 
 app.post('/api/proyectos/:id/materiales', async (request, response) => {
+  const connection = await pool.getConnection();
   try {
     await ensureProjectSupport();
     const projectId = Number(request.params.id);
@@ -1217,47 +1367,85 @@ app.post('/api/proyectos/:id/materiales', async (request, response) => {
       return response.status(400).json({ message: 'Material y cantidad válidos son obligatorios.' });
     }
 
-    const [materialRows] = await pool.execute(
+    const [projectRows] = await connection.execute(
+      'SELECT nombre_proyecto FROM proyectos WHERE id_proyecto = ? LIMIT 1',
+      [projectId]
+    );
+    if (!projectRows[0]) {
+      connection.release();
+      return response.status(404).json({ message: 'Proyecto no encontrado.' });
+    }
+
+    const [materialRows] = await connection.execute(
       'SELECT precio_unitario FROM materiales WHERE id_material = ? LIMIT 1',
       [materialId]
     );
 
     if (!materialRows[0]) {
+      connection.release();
       return response.status(404).json({ message: 'Material no encontrado.' });
     }
 
     const finalUnitPrice = Number(precio_unitario ?? materialRows[0].precio_unitario ?? 0);
     const subtotal = Number((quantity * finalUnitPrice).toFixed(2));
 
-    await pool.execute(
+    await connection.beginTransaction();
+    await applyInventoryDelta(connection, materialId, 'Salida', quantity);
+    await connection.execute(
+      'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
+      [materialId, finalUserId, 'Salida', quantity, `Proyecto: ${projectRows[0].nombre_proyecto}`, 'Material asignado al proyecto']
+    );
+    await connection.execute(
       `INSERT INTO proyecto_materiales (id_usuario, id_proyecto, id_material, cantidad_calculada, costo_subtotal)
        VALUES (?, ?, ?, ?, ?)`,
       [finalUserId, projectId, materialId, quantity, subtotal]
     );
 
-    await syncProjectMaterialSummary(pool, projectId);
+    await syncProjectMaterialSummary(connection, projectId);
+    await connection.commit();
+    connection.release();
     response.status(201).json({ message: 'Material agregado al proyecto correctamente.' });
-  } catch (_error) {
-    response.status(500).json({ message: 'No fue posible guardar el material del proyecto.' });
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    response.status(error.statusCode || 500).json({ message: error.message || 'No fue posible guardar el material del proyecto.' });
   }
 });
 
 app.delete('/api/proyectos/:id/materiales/:detalleId', async (request, response) => {
+  const connection = await pool.getConnection();
   try {
     await ensureProjectSupport();
-    const [result] = await pool.execute(
-      'DELETE FROM proyecto_materiales WHERE id_proyecto = ? AND id_detalle = ?',
+    const [rows] = await connection.execute(
+      `SELECT pm.id_material, pm.cantidad_calculada, p.nombre_proyecto
+       FROM proyecto_materiales pm JOIN proyectos p ON p.id_proyecto = pm.id_proyecto
+       WHERE pm.id_proyecto = ? AND pm.id_detalle = ?`,
       [request.params.id, request.params.detalleId]
     );
 
-    if (result.affectedRows === 0) {
+    if (!rows[0]) {
+      connection.release();
       return response.status(404).json({ message: 'Material del proyecto no encontrado.' });
     }
 
-    await syncProjectMaterialSummary(pool, Number(request.params.id));
+    await connection.beginTransaction();
+    await applyInventoryDelta(connection, rows[0].id_material, 'Entrada', rows[0].cantidad_calculada);
+    await connection.execute(
+      'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
+      [rows[0].id_material, request.user?.sub || null, 'Entrada', rows[0].cantidad_calculada, `Reversión proyecto: ${rows[0].nombre_proyecto}`, 'Material retirado de la asignación del proyecto']
+    );
+    await connection.execute(
+      'DELETE FROM proyecto_materiales WHERE id_proyecto = ? AND id_detalle = ?',
+      [request.params.id, request.params.detalleId]
+    );
+    await syncProjectMaterialSummary(connection, Number(request.params.id));
+    await connection.commit();
+    connection.release();
     response.json({ message: 'Material del proyecto eliminado correctamente.' });
-  } catch (_error) {
-    response.status(500).json({ message: 'No fue posible eliminar el material del proyecto.' });
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    response.status(error.statusCode || 500).json({ message: error.message || 'No fue posible eliminar el material del proyecto.' });
   }
 });
 
@@ -1318,7 +1506,7 @@ app.post('/api/proyectos', async (request, response) => {
 
     const projectId = Number(result.insertId);
     if (Array.isArray(materiales) && materiales.length) {
-      await upsertProjectMaterialRelations(pool, projectId, materiales);
+      await upsertProjectMaterialRelations(pool, projectId, materiales, finalUsuarioId);
     }
 
     response.status(201).json({ id: projectId, id_proyecto: projectId, message: 'Proyecto guardado correctamente.' });
@@ -1383,7 +1571,7 @@ app.put('/api/proyectos/:id', async (request, response) => {
     if (result.affectedRows === 0) return response.status(404).json({ message: 'Proyecto no encontrado.' });
 
     if (Array.isArray(request.body.materiales) && request.body.materiales.length) {
-      await upsertProjectMaterialRelations(pool, Number(request.params.id), request.body.materiales);
+      await upsertProjectMaterialRelations(pool, Number(request.params.id), request.body.materiales, finalUsuarioId);
     }
 
     response.json({ message: 'Proyecto actualizado correctamente.' });

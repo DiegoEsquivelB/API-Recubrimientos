@@ -8,6 +8,16 @@ Backend REST del sistema de gestión para recubrimientos arquitectónicos.
 - MySQL 8 o superior
 - Base de datos con nombre `recubrimientos`
 
+## Librerías del backend
+
+- `express 5.1.0`: creación de la API REST y manejo de rutas HTTP.
+- `mysql2 3.14.3`: conexión y consultas parametrizadas a MySQL.
+- `bcryptjs 3.0.2`: hash y verificación de contraseñas.
+- `cors 2.8.6`: configuración de solicitudes desde el frontend.
+- `dotenv 16.4.7`: carga de variables de entorno desde `.env`.
+
+Las dependencias se instalan con `npm install` y están definidas en `package.json`.
+
 ## Instalación
 
 ```powershell
@@ -54,6 +64,13 @@ La API queda disponible en:
 - Cálculo de materiales por proyecto
 - CRUD de proyectos
 - Reportes y panel principal
+
+## Roles y permisos
+
+- `Administrador`: acceso completo, incluida la creación, consulta, edición y eliminación de usuarios.
+- `Operador`: acceso al panel, clientes, proyectos, cálculo de materiales, inventario, materiales y reportes. No puede acceder ni operar el módulo de usuarios.
+
+La API valida el rol en cada solicitud al módulo de usuarios y responde `403` cuando un operador intenta acceder directamente.
 
 ## Rutas principales
 
@@ -105,6 +122,11 @@ La API queda disponible en:
 - `POST /api/inventario/movimientos`
 - `PUT /api/inventario/movimientos/:id`
 - `DELETE /api/inventario/movimientos/:id`
+
+### Reportes
+- `GET /api/reportes?tipo=Clientes%20registrados`
+- Tipos: `Clientes registrados`, `Proyectos por estado`, `Inventario actual`, `Movimientos de inventario` y `Consumo de materiales`.
+- Filtros opcionales: `desde`, `hasta` y `estado` (este último aplica a proyectos).
 
 ## Usuario predeterminado
 
