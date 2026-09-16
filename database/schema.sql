@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS usuarios (
   password_hash VARCHAR(255) NOT NULL,
   rol ENUM('Administrador', 'Operador') NOT NULL DEFAULT 'Operador',
   estado ENUM('Activo', 'Inactivo') NOT NULL DEFAULT 'Activo',
+  estado_archivado ENUM('Activo', 'Archivado') NOT NULL DEFAULT 'Activo',
   fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS clientes (
   correo VARCHAR(160) NOT NULL,
   direccion VARCHAR(255),
   notas TEXT,
+  estado_archivado ENUM('Activo', 'Archivado') NOT NULL DEFAULT 'Activo',
   fecha_registro TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE SET NULL ON UPDATE CASCADE
 );
@@ -43,8 +45,11 @@ CREATE TABLE IF NOT EXISTS materiales (
   tipo VARCHAR(60) NOT NULL,
   rendimiento_m2_gal DECIMAL(10,2) NOT NULL DEFAULT 35.00,
   precio_unitario DECIMAL(10,2) NOT NULL,
+  precio_venta DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   unidad_medida VARCHAR(20) NOT NULL DEFAULT 'Galón',
   descripcion TEXT NULL,
+  imagen LONGTEXT NULL,
+  estado ENUM('Activo', 'Archivado') NOT NULL DEFAULT 'Activo',
   FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE SET NULL ON UPDATE CASCADE,
   FOREIGN KEY (id_categoria) REFERENCES material_categorias(id_categoria) ON DELETE SET NULL ON UPDATE CASCADE
 );
@@ -54,7 +59,8 @@ INSERT IGNORE INTO material_categorias (nombre, prefijo_codigo) VALUES
   ('Sellador', 'SEL'),
   ('Esmalte', 'ESM'),
   ('Impermeabilizante', 'IMP'),
-  ('Accesorio', 'ACC');
+  ('Accesorio', 'ACC'),
+  ('Mano de obra', 'MDO');
 
 CREATE TABLE IF NOT EXISTS inventario (
   id_inventario INT AUTO_INCREMENT PRIMARY KEY,
@@ -67,6 +73,16 @@ CREATE TABLE IF NOT EXISTS inventario (
   FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE SET NULL ON UPDATE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS inventario_lotes (
+  id_lote INT AUTO_INCREMENT PRIMARY KEY,
+  id_material INT NOT NULL,
+  cantidad_inicial DECIMAL(10,2) NOT NULL,
+  cantidad_disponible DECIMAL(10,2) NOT NULL,
+  costo_unitario DECIMAL(10,2) NOT NULL DEFAULT 0,
+  fecha_entrada DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (id_material) REFERENCES materiales(id_material) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS movimientos_inventario (
   id_movimiento INT AUTO_INCREMENT PRIMARY KEY,
   material_id INT NOT NULL,
@@ -74,6 +90,7 @@ CREATE TABLE IF NOT EXISTS movimientos_inventario (
   tipo ENUM('Entrada', 'Salida') NOT NULL,
   fecha DATE NOT NULL,
   cantidad DECIMAL(10,2) NOT NULL,
+  costo_unitario DECIMAL(10,2) NOT NULL DEFAULT 0,
   referencia VARCHAR(120),
   notas TEXT,
   fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -90,13 +107,22 @@ CREATE TABLE IF NOT EXISTS proyectos (
   area_m2 DECIMAL(10,2) NOT NULL,
   altura DECIMAL(10,2) NULL,
   tipo VARCHAR(80) NULL,
+  id_mano_obra INT NULL,
+  mano_obra_precio_m2 DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   descripcion TEXT NULL,
   estado ENUM('Pendiente', 'En proceso', 'Finalizado') NOT NULL DEFAULT 'Pendiente',
+  estado_archivado ENUM('Activo', 'Archivado') NOT NULL DEFAULT 'Activo',
+  costo_materiales DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  costo_mano_obra DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  precio_mano_obra DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  costo_total DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  precio_cotizacion DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   costo_estimado DECIMAL(10,2) DEFAULT 0.00,
   fecha_inicio DATE,
   fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente),
-  FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario)
+  FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario),
+  FOREIGN KEY (id_mano_obra) REFERENCES materiales(id_material) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS proyecto_materiales (
@@ -106,6 +132,8 @@ CREATE TABLE IF NOT EXISTS proyecto_materiales (
   id_material INT NOT NULL,
   cantidad_calculada DECIMAL(10,2) NOT NULL,
   costo_subtotal DECIMAL(10,2) NOT NULL,
+  precio_subtotal DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  detalle_peps LONGTEXT NULL,
   FOREIGN KEY (id_proyecto) REFERENCES proyectos(id_proyecto) ON DELETE CASCADE,
   FOREIGN KEY (id_material) REFERENCES materiales(id_material),
   FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE SET NULL ON UPDATE CASCADE

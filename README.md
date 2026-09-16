@@ -60,7 +60,8 @@ La API queda disponible en:
 
 - Autenticación de usuarios
 - Gestión de clientes
-- Gestión de materiales e inventario
+- Gestión de materiales con imagen, estado activo o archivado e inventario
+- Inventario con método PEPS y costos unitarios por entrada
 - Cálculo de materiales por proyecto
 - CRUD de proyectos
 - Reportes y panel principal
@@ -98,14 +99,19 @@ La API valida el rol en cada solicitud al módulo de usuarios y responde `403` c
 
 ### Materiales
 - `GET /api/materiales`
+- `GET /api/materiales?estado=Archivado`
 - `GET /api/materiales/:id`
 - `POST /api/materiales`
 - `PUT /api/materiales/:id`
+- `PATCH /api/materiales/:id/archivar`
+- `PATCH /api/materiales/:id/desarchivar`
 - `DELETE /api/materiales/:id`
 - `GET /api/materiales/categorias`
 - `POST /api/materiales/categorias`
 - `PUT /api/materiales/categorias/:id`
 - `DELETE /api/materiales/categorias/:id`
+
+Los materiales incluyen los campos `imagen` y `estado`. La imagen se almacena como `LONGTEXT` y el estado permite separar el catálogo activo de los materiales archivados. El borrado definitivo de un material elimina sus movimientos, lotes, inventario y relaciones con proyectos dentro de una transacción.
 
 ### Proyectos
 - `GET /api/proyectos`
@@ -123,6 +129,10 @@ La API valida el rol en cada solicitud al módulo de usuarios y responde `403` c
 - `PUT /api/inventario/movimientos/:id`
 - `DELETE /api/inventario/movimientos/:id`
 
+El inventario utiliza el método PEPS, Primero en Entrar, Primero en Salir. Cada entrada crea un registro en `inventario_lotes` con cantidad inicial, cantidad disponible, costo unitario y fecha de entrada. Las salidas consumen primero los lotes más antiguos y calculan el costo real con base en los lotes utilizados.
+
+El campo `costo_unitario` es obligatorio en entradas de inventario y opcional en salidas, porque en las salidas el costo se calcula automáticamente con PEPS. Cuando un proyecto consume materiales, el desglose de lotes queda guardado en `proyecto_materiales.detalle_peps`.
+
 ### Reportes
 - `GET /api/reportes?tipo=Clientes%20registrados`
 - Tipos: `Clientes registrados`, `Proyectos por estado`, `Inventario actual`, `Movimientos de inventario` y `Consumo de materiales`.
@@ -138,3 +148,4 @@ La API valida el rol en cada solicitud al módulo de usuarios y responde `403` c
 - La API usa cookies de sesión para autenticación.
 - El backend exige sesión válida para acceder a rutas protegidas dentro de `/api`.
 - El frontend se conecta automáticamente a `http://localhost:3000/api` desde la UI web.
+- Al iniciar, la API ejecuta validaciones de compatibilidad del esquema y puede crear o completar columnas y tablas requeridas por versiones recientes, como `inventario_lotes`, `materiales.imagen`, `materiales.estado`, `movimientos_inventario.costo_unitario` y `proyecto_materiales.detalle_peps`.
