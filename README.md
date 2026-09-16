@@ -37,6 +37,18 @@ DB_USER=root
 DB_PASSWORD=root
 ```
 
+Para producción configure también las variables de sesión y el dominio del frontend:
+
+```env
+NODE_ENV=production
+FRONTEND_URL=https://dominio-del-frontend.com
+SESSION_SECRET=una-clave-larga-y-aleatoria
+COOKIE_SAMESITE=none
+COOKIE_SECURE=true
+```
+
+El frontend debe enviar las credenciales en las solicitudes, por ejemplo con `credentials: 'include'`. `FRONTEND_URL` puede contener varios dominios separados por comas.
+
 Luego importe el esquema si aún no existe:
 
 ```powershell

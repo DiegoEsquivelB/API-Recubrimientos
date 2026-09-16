@@ -12,10 +12,14 @@ const sessionCookieName = process.env.SESSION_COOKIE_NAME || 'recubrimientos_ses
 const sessionSecret = process.env.SESSION_SECRET || 'recubrimientos-dev-session-secret';
 const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 8);
 const rememberSessionTtlMs = Number(process.env.REMEMBER_SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 30);
-const cookieSameSite = process.env.COOKIE_SAMESITE || 'lax';
+const cookieSameSite = process.env.COOKIE_SAMESITE || (process.env.NODE_ENV === 'production' ? 'none' : 'lax');
 const cookieSecure = process.env.COOKIE_SECURE
   ? process.env.COOKIE_SECURE === 'true'
   : process.env.NODE_ENV === 'production';
+const corsOrigins = (process.env.FRONTEND_URL || 'http://127.0.0.1:5500,http://localhost:5500')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   port: Number(process.env.DB_PORT || 3306),
@@ -714,10 +718,7 @@ async function applyInventoryDelta(connection, materialId, tipo, cantidad, direc
 }
 
 app.use(cors({
-  origin: [
-    'http://127.0.0.1:5500',
-    'http://localhost:5500'
-  ],
+  origin: corsOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type'],
   credentials: true
