@@ -276,8 +276,6 @@ async function ensureUserDeleteAuditTrigger() {
 
 }
 
-const DEFAULT_MATERIAL_CATEGORIES = ['Pintura', 'Sellador', 'Esmalte', 'Impermeabilizante', 'Accesorio'];
-
 function isValidMaterialImage(image) {
   return !image || (
     typeof image === 'string' &&
@@ -316,23 +314,6 @@ async function ensureMaterialCategorySupport() {
     await pool.query('ALTER TABLE material_categorias ADD COLUMN prefijo_codigo VARCHAR(10) NULL');
   } catch (_error) {
     // Existing installations may already include this column.
-  }
-
-  const categoryDefaults = {
-    Pintura: 'PIN',
-    Sellador: 'SEL',
-    Esmalte: 'ESM',
-    Impermeabilizante: 'IMP',
-    Accesorio: 'ACC',
-    'Mano de obra': 'MDO'
-  };
-
-  for (const category of [...DEFAULT_MATERIAL_CATEGORIES, 'Mano de obra']) {
-    const prefix = categoryDefaults[category] || category.slice(0, 3).toUpperCase();
-    await pool.execute(
-      'INSERT INTO material_categorias (nombre, prefijo_codigo) VALUES (?, ?) ON DUPLICATE KEY UPDATE prefijo_codigo = VALUES(prefijo_codigo)',
-      [category, prefix]
-    );
   }
 
   try {
