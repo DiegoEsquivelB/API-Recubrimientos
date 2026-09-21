@@ -1,32 +1,67 @@
 # API Proyecto G2
 
-Backend REST del sistema de gestión para recubrimientos arquitectónicos.
+Backend REST para la gestión de recubrimientos arquitectónicos, desarrollado con Node.js y MySQL.
 
-## Requisitos
+## Descripción
+
+Esta API expone servicios para:
+
+- autenticación y gestión de usuarios
+- administración de clientes
+- catálogo de materiales con categorías, imagen y estado
+- control de inventario con movimientos y lotes
+- cálculo de materiales por proyecto
+- gestión de proyectos y costos asociados
+- reportes básicos del sistema
+
+## Stack
+
+- Node.js 18+
+- Express 5
+- MySQL 8+
+- mysql2
+- bcryptjs
+- cors
+- dotenv
+
+## Estructura del proyecto
+
+```text
+API-ProyectoG2/
+├── database/
+│   └── schema.sql
+├── src/
+│   └── server.js
+├── .env.example
+├── .gitignore
+├── package.json
+├── package-lock.json
+├── README.md
+└── image/
+```
+
+## Requisitos previos
 
 - Node.js 18 o superior
 - MySQL 8 o superior
-- Base de datos con nombre `recubrimientos`
-
-## Librerías del backend
-
-- `express 5.1.0`: creación de la API REST y manejo de rutas HTTP.
-- `mysql2 3.14.3`: conexión y consultas parametrizadas a MySQL.
-- `bcryptjs 3.0.2`: hash y verificación de contraseñas.
-- `cors 2.8.6`: configuración de solicitudes desde el frontend.
-- `dotenv 16.4.7`: carga de variables de entorno desde `.env`.
-
-Las dependencias se instalan con `npm install` y están definidas en `package.json`.
+- Base de datos llamada `recubrimientos`
 
 ## Instalación
 
+1. Clona o abre la carpeta del proyecto.
+2. Instala dependencias:
+
 ```powershell
-cd "API-ProyectoG2"
 npm install
+```
+
+3. Crea el archivo `.env` a partir del ejemplo:
+
+```powershell
 Copy-Item .env.example .env
 ```
 
-Configure el archivo `.env` con la conexión a MySQL:
+4. Configura las variables de conexión:
 
 ```env
 PORT=3000
@@ -37,57 +72,87 @@ DB_USER=root
 DB_PASSWORD=root
 ```
 
-Para producción configure también las variables de sesión y el dominio del frontend:
+Opcionalmente para entorno de producción:
 
 ```env
 NODE_ENV=production
-FRONTEND_URL=https://dominio-del-frontend.com
+FRONTEND_URL=http://localhost:5500
 SESSION_SECRET=una-clave-larga-y-aleatoria
-COOKIE_SAMESITE=none
-COOKIE_SECURE=true
+COOKIE_SAMESITE=lax
+COOKIE_SECURE=false
+SESSION_COOKIE_NAME=recubrimientos_session
 ```
 
-El frontend debe enviar las credenciales en las solicitudes, por ejemplo con `credentials: 'include'`. `FRONTEND_URL` puede contener varios dominios separados por comas.
+> `FRONTEND_URL` puede recibir varios orígenes separados por comas.
 
-Luego importe el esquema si aún no existe:
+## Base de datos
+
+Importa el esquema SQL si aún no existe:
 
 ```powershell
 mysql -u root -p < database\schema.sql
 ```
 
-O puede ejecutarlo desde MySQL Workbench.
+También puedes ejecutarlo desde MySQL Workbench o desde una herramienta de administración.
 
 ## Ejecutar la API
+
+Modo desarrollo:
 
 ```powershell
 npm run dev
 ```
 
+Modo producción:
+
+```powershell
+npm start
+```
+
 La API queda disponible en:
 
-- `http://localhost:3000`
-- `http://localhost:3000/api/health`
+- http://localhost:3000
+- http://localhost:3000/api/health
 
-## Funcionalidades principales
+## Autenticación
 
-- Autenticación de usuarios
-- Gestión de clientes
-- Gestión de materiales con imagen, estado activo o archivado e inventario
-- Inventario con método PEPS y costos unitarios por entrada
-- Cálculo de materiales por proyecto
-- CRUD de proyectos
-- Reportes y panel principal
+La API usa cookies de sesión para autenticar solicitudes protegidas. Todas las rutas bajo `/api` requieren una sesión válida, excepto el login y el health check.
+
+### Login
+
+```http
+POST /api/auth/login
+Content-Type: application/json
+
+{
+  "usuario": "admin@recubrimientos.com",
+  "contrasena": "admin123",
+  "recordar": true
+}
+```
+
+### Sesión
+
+- `GET /api/auth/session`
+- `GET /api/auth/me`
+- `POST /api/auth/logout`
+
+## Usuarios por defecto
+
+El sistema crea automáticamente un usuario administrador si no existe:
+
+- Email: `admin@recubrimientos.com`
+- Contraseña: `admin123`
 
 ## Roles y permisos
 
-- `Administrador`: acceso completo, incluida la creación, consulta, edición y eliminación de usuarios.
-- `Operador`: acceso al panel, clientes, proyectos, cálculo de materiales, inventario, materiales y reportes. No puede acceder ni operar el módulo de usuarios.
+- `Administrador`: acceso completo al módulo de usuarios y administración general.
+- `Operador`: acceso a clientes, materiales, inventario, proyectos, reportes y panel; no puede administrar usuarios.
 
-La API valida el rol en cada solicitud al módulo de usuarios y responde `403` cuando un operador intenta acceder directamente.
-
-## Rutas principales
+## Endpoints principales
 
 ### Autenticación
+
 - `GET /api/health`
 - `POST /api/auth/login`
 - `GET /api/auth/session`
@@ -96,6 +161,7 @@ La API valida el rol en cada solicitud al módulo de usuarios y responde `403` c
 - `POST /api/auth/usuarios`
 
 ### Usuarios
+
 - `GET /api/usuarios`
 - `GET /api/usuarios/:id`
 - `POST /api/usuarios`
@@ -103,61 +169,69 @@ La API valida el rol en cada solicitud al módulo de usuarios y responde `403` c
 - `DELETE /api/usuarios/:id`
 
 ### Clientes
+
 - `GET /api/clientes`
 - `GET /api/clientes/:id`
 - `POST /api/clientes`
 - `PUT /api/clientes/:id`
 - `DELETE /api/clientes/:id`
+- `PATCH /api/clientes/:id/archivar`
+- `PATCH /api/clientes/:id/desarchivar`
 
 ### Materiales
+
 - `GET /api/materiales`
-- `GET /api/materiales?estado=Archivado`
-- `GET /api/materiales/:id`
-- `POST /api/materiales`
-- `PUT /api/materiales/:id`
-- `PATCH /api/materiales/:id/archivar`
-- `PATCH /api/materiales/:id/desarchivar`
-- `DELETE /api/materiales/:id`
 - `GET /api/materiales/categorias`
 - `POST /api/materiales/categorias`
 - `PUT /api/materiales/categorias/:id`
 - `DELETE /api/materiales/categorias/:id`
 
-Los materiales incluyen los campos `imagen` y `estado`. La imagen se almacena como `LONGTEXT` y el estado permite separar el catálogo activo de los materiales archivados. El borrado definitivo de un material elimina sus movimientos, lotes, inventario y relaciones con proyectos dentro de una transacción.
-
-### Proyectos
-- `GET /api/proyectos`
-- `GET /api/proyectos/:id`
-- `POST /api/proyectos`
-- `PUT /api/proyectos/:id`
-- `DELETE /api/proyectos/:id`
-
-> La API incluye una validación de compatibilidad del esquema para agregar la columna `id_usuario` en `proyectos` cuando la instalación existente la carece.
-
 ### Inventario
+
 - `GET /api/inventario`
 - `GET /api/inventario/movimientos`
 - `POST /api/inventario/movimientos`
 - `PUT /api/inventario/movimientos/:id`
 - `DELETE /api/inventario/movimientos/:id`
 
-El inventario utiliza el método PEPS, Primero en Entrar, Primero en Salir. Cada entrada crea un registro en `inventario_lotes` con cantidad inicial, cantidad disponible, costo unitario y fecha de entrada. Las salidas consumen primero los lotes más antiguos y calculan el costo real con base en los lotes utilizados.
+### Proyectos
 
-El campo `costo_unitario` es obligatorio en entradas de inventario y opcional en salidas, porque en las salidas el costo se calcula automáticamente con PEPS. Cuando un proyecto consume materiales, el desglose de lotes queda guardado en `proyecto_materiales.detalle_peps`.
+- `GET /api/proyectos`
+- `GET /api/proyectos/:id`
+- `POST /api/proyectos`
+- `PUT /api/proyectos/:id`
+- `DELETE /api/proyectos/:id`
 
-### Reportes
-- `GET /api/reportes?tipo=Clientes%20registrados`
-- Tipos: `Clientes registrados`, `Proyectos por estado`, `Inventario actual`, `Movimientos de inventario` y `Consumo de materiales`.
-- Filtros opcionales: `desde`, `hasta` y `estado` (este último aplica a proyectos).
+## Funcionalidades relevantes
 
-## Usuario predeterminado
+- catálogo de materiales con código, categoría, imagen y estado activo/archivado
+- inventario con control de stock y lotes por PEPS
+- cálculo de costo por salida con base en lotes más antiguos
+- proyectos con materiales asignados, costos y detalle PEPS
+- compatibilidad automática de esquema para cubrir columnas y tablas nuevas
+- validación de permisos por rol
 
-- Usuario: `admin@recubrimientos.com`
-- Contraseña: `admin123`
+## Notas importantes
 
-## Notas
-
-- La API usa cookies de sesión para autenticación.
 - El backend exige sesión válida para acceder a rutas protegidas dentro de `/api`.
-- El frontend se conecta automáticamente a `http://localhost:3000/api` desde la UI web.
-- Al iniciar, la API ejecuta validaciones de compatibilidad del esquema y puede crear o completar columnas y tablas requeridas por versiones recientes, como `inventario_lotes`, `materiales.imagen`, `materiales.estado`, `movimientos_inventario.costo_unitario` y `proyecto_materiales.detalle_peps`.
+- El archivo `database/schema.sql` crea la base de datos, tablas, vistas y datos iniciales básicos.
+- La API realiza migraciones leves al arrancar para agregar columnas o tablas faltantes cuando la base ya existe.
+- En desarrollo, por defecto se aceptan orígenes locales como `http://localhost:5500` y `http://127.0.0.1:5500`.
+
+## Comandos útiles
+
+```powershell
+npm install
+npm run dev
+npm start
+```
+
+## Troubleshooting
+
+Si la API no puede conectarse a MySQL, verifica:
+
+- que MySQL esté corriendo
+- que la base `recubrimientos` exista
+- que `.env` tenga los valores correctos
+- que el usuario de MySQL tenga permisos para crear y modificar tablas
+
