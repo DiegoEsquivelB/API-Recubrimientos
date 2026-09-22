@@ -195,6 +195,12 @@ async function generateMaterialCode(connection, categoryInput, categoryNameFallb
   return `${normalizedPrefix}-${String(maxNumber + 1).padStart(3, '0')}`;
 }
 
+function nextMaterialCodeFrom(code) {
+  const match = String(code || '').match(/^(.*-)(\d+)$/);
+  if (!match) return `${code}-1`;
+  return `${match[1]}${String(Number(match[2]) + 1).padStart(match[2].length, '0')}`;
+}
+
 function sessionCookieOptions(remember = false) {
   return {
     httpOnly: true,
@@ -1357,12 +1363,17 @@ app.post('/api/materiales', async (request, response) => {
       ? variaciones
       : [{ color, codigo_color }];
     const createdIds = [];
+    const generatedCodes = new Set();
 
     for (const variation of variationList) {
       const variationColor = String(variation?.color || '').trim() || null;
       const variationCode = String(variation?.codigo_color || '').trim() || null;
       const variationName = variationColor ? `${nombre} - ${variationColor}` : nombre;
-      const finalCodigo = await generateMaterialCode(connection, categoryId ?? (id_categoria ?? categoria_id ?? categoria ?? tipo), materialTipo);
+      let finalCodigo = await generateMaterialCode(connection, categoryId ?? (id_categoria ?? categoria_id ?? categoria ?? tipo), materialTipo);
+      while (generatedCodes.has(finalCodigo)) {
+        finalCodigo = nextMaterialCodeFrom(finalCodigo);
+      }
+      generatedCodes.add(finalCodigo);
       const [result] = await connection.execute(
         'INSERT INTO materiales (id_usuario, id_categoria, codigo, nombre, marca, color, codigo_color, tipo, rendimiento_m2_gal, precio_unitario, precio_venta, unidad_medida, descripcion, imagen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [finalUserId, categoryId, finalCodigo, variationName, marca || null, variationColor, variationCode, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, unidadMedida, descripcion || null, imagen || null]
