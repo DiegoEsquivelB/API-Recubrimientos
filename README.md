@@ -186,6 +186,8 @@ El sistema crea automáticamente un usuario administrador si no existe:
 - `PUT /api/materiales/categorias/:id`
 - `DELETE /api/materiales/categorias/:id`
 
+Las categorías iniciales (`Pintura`, `Sellador`, `Esmalte`, `Impermeabilizante`, `Accesorio` y `Mano de obra`) se crean al importar el esquema. Después pueden editarse o eliminarse desde el módulo correspondiente; para eliminar una categoría se requiere rol `Administrador` y no debe tener materiales asociados.
+
 ### Inventario
 
 - `GET /api/inventario`
