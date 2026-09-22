@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS materiales (
   id_categoria INT NULL,
   codigo VARCHAR(20) NOT NULL UNIQUE,
   nombre VARCHAR(100) NOT NULL,
+  marca VARCHAR(80) NULL,
   color VARCHAR(60) NULL,
   codigo_color VARCHAR(7) NULL,
   tipo VARCHAR(60) NOT NULL,
