@@ -12,6 +12,9 @@ const sessionCookieName = process.env.SESSION_COOKIE_NAME || 'recubrimientos_ses
 const sessionSecret = process.env.SESSION_SECRET || 'recubrimientos-dev-session-secret';
 const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 8);
 const rememberSessionTtlMs = Number(process.env.REMEMBER_SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 30);
+const materialImageMaxMb = Number(process.env.MATERIAL_IMAGE_MAX_MB || 5);
+const materialImageMaxChars = Math.ceil(materialImageMaxMb * 1024 * 1024 * 4 / 3) + 100;
+const jsonBodyLimitMb = Math.ceil(materialImageMaxMb * 4 / 3) + 1;
 const cookieSameSite = process.env.COOKIE_SAMESITE || (process.env.NODE_ENV === 'production' ? 'none' : 'lax');
 const cookieSecure = process.env.COOKIE_SECURE
   ? process.env.COOKIE_SECURE === 'true'
@@ -279,7 +282,7 @@ async function ensureUserDeleteAuditTrigger() {
 function isValidMaterialImage(image) {
   return !image || (
     typeof image === 'string' &&
-    image.length <= 3000000 &&
+    image.length <= materialImageMaxChars &&
     /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/.test(image)
   );
 }
@@ -705,7 +708,7 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json({ limit: '6mb' }));
+app.use(express.json({ limit: `${jsonBodyLimitMb}mb` }));
 
 app.get('/', (_request, response) => {
   response.json({
@@ -1278,7 +1281,7 @@ app.post('/api/materiales', async (request, response) => {
   const initialStock = Number(stock_inicial || 0);
 
   if (!isValidMaterialImage(imagen)) {
-    return response.status(400).json({ message: 'La imagen debe ser JPG, PNG o WebP y no superar 2 MB.' });
+    return response.status(400).json({ message: `La imagen debe ser JPG, PNG o WebP y no superar ${materialImageMaxMb} MB.` });
   }
 
   await ensureMaterialCategorySupport();
@@ -1353,7 +1356,7 @@ app.put('/api/materiales/:id', async (request, response) => {
   const requestedUserId = id_usuario || usuario_id || usuario || null;
 
   if (!isValidMaterialImage(imagen)) {
-    return response.status(400).json({ message: 'La imagen debe ser JPG, PNG o WebP y no superar 2 MB.' });
+    return response.status(400).json({ message: `La imagen debe ser JPG, PNG o WebP y no superar ${materialImageMaxMb} MB.` });
   }
 
   await ensureMaterialCategorySupport();
