@@ -1243,13 +1243,16 @@ app.get('/api/materiales/:id/variaciones', async (request, response) => {
         m.id_material AS id,
         m.nombre,
         m.color,
-        m.codigo_color
+        m.codigo_color,
+        COALESCE(i.stock_actual, 0) AS stock_actual
       FROM materiales actual
       JOIN materiales m
         ON m.marca <=> actual.marca
         AND m.tipo = actual.tipo
         AND m.descripcion <=> actual.descripcion
         AND m.estado = 'Activo'
+      LEFT JOIN inventario i
+        ON i.id_material = m.id_material
       WHERE actual.id_material = ?
       ORDER BY m.id_material ASC
     `, [request.params.id]);
