@@ -1336,6 +1336,9 @@ app.post('/api/materiales', async (request, response) => {
   const isLabor = String(materialTipo || '').trim().toLowerCase() === 'mano de obra';
   const shouldRegisterInventory = !isLabor;
   const initialStock = Number(stock_inicial || 0);
+  const variationList = Array.isArray(variaciones) && variaciones.length
+    ? variaciones
+    : [{ color, codigo_color }];
 
   if (!isValidMaterialImage(imagen)) {
     return response.status(400).json({ message: `La imagen debe ser JPG, PNG o WebP y no superar ${materialImageMaxMb} MB.` });
@@ -1354,14 +1357,14 @@ app.post('/api/materiales', async (request, response) => {
       return response.status(400).json({ message: 'Nombre, categoría y unidad son obligatorios.' });
     }
 
-    if (shouldRegisterInventory && (!Number.isFinite(initialStock) || initialStock <= 0)) {
+    if (shouldRegisterInventory && variationList.some((variation) => {
+      const quantity = Number(variation?.stock_inicial ?? initialStock);
+      return !Number.isFinite(quantity) || quantity <= 0;
+    })) {
       await connection.rollback();
-      return response.status(400).json({ message: 'La cantidad inicial debe ser mayor a cero.' });
+      return response.status(400).json({ message: 'La cantidad inicial de cada variación debe ser mayor a cero.' });
     }
 
-    const variationList = Array.isArray(variaciones) && variaciones.length
-      ? variaciones
-      : [{ color, codigo_color }];
     const createdIds = [];
     const generatedCodes = new Set();
 
@@ -1387,10 +1390,11 @@ app.post('/api/materiales', async (request, response) => {
       }
 
       if (shouldRegisterInventory) {
-        await applyInventoryDelta(connection, result.insertId, 'Entrada', initialStock, 1, Number(precioUnitario));
+        const variationStock = Number(variation?.stock_inicial ?? initialStock);
+        await applyInventoryDelta(connection, result.insertId, 'Entrada', variationStock, 1, Number(precioUnitario));
         await connection.execute(
           'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
-          [result.insertId, finalUserId, 'Entrada', initialStock, referencia_inventario || 'Inventario inicial', 'Registro creado desde materiales']
+          [result.insertId, finalUserId, 'Entrada', variationStock, referencia_inventario || 'Inventario inicial', 'Registro creado desde materiales']
         );
       }
     }
