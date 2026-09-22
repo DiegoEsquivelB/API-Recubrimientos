@@ -1336,6 +1336,10 @@ app.post('/api/materiales', async (request, response) => {
   const isLabor = String(materialTipo || '').trim().toLowerCase() === 'mano de obra';
   const shouldRegisterInventory = !isLabor;
   const initialStock = Number(stock_inicial || 0);
+  const hasMarca = String(marca || '').trim().length > 0;
+  const hasCosto = costo !== undefined && costo !== null && String(costo).trim() !== ''
+    || precio_unitario !== undefined && precio_unitario !== null && String(precio_unitario).trim() !== '';
+  const hasStockMinimo = stock_minimo !== undefined && stock_minimo !== null && String(stock_minimo).trim() !== '';
   const variationList = Array.isArray(variaciones) && variaciones.length
     ? variaciones
     : [{ color, codigo_color }];
@@ -1355,6 +1359,11 @@ app.post('/api/materiales', async (request, response) => {
     if (!nombre || !materialTipo || !unidadMedida) {
       await connection.rollback();
       return response.status(400).json({ message: 'Nombre, categoría y unidad son obligatorios.' });
+    }
+
+    if (!isLabor && (!hasMarca || !hasCosto || !hasStockMinimo || !imagen)) {
+      await connection.rollback();
+      return response.status(400).json({ message: 'Marca, imagen, costo unitario, stock mínimo y cantidad inicial son obligatorios.' });
     }
 
     if (shouldRegisterInventory && variationList.some((variation) => {
@@ -1433,6 +1442,11 @@ app.put('/api/materiales/:id', async (request, response) => {
   const stockMinimo = stock_minimo || 0;
   const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
   const requestedUserId = id_usuario || usuario_id || usuario || null;
+  const isLabor = String(materialTipo || '').trim().toLowerCase() === 'mano de obra';
+  const hasMarca = String(marca || '').trim().length > 0;
+  const hasCosto = costo !== undefined && costo !== null && String(costo).trim() !== ''
+    || precio_unitario !== undefined && precio_unitario !== null && String(precio_unitario).trim() !== '';
+  const hasStockMinimo = stock_minimo !== undefined && stock_minimo !== null && String(stock_minimo).trim() !== '';
 
   if (!isValidMaterialImage(imagen)) {
     return response.status(400).json({ message: `La imagen debe ser JPG, PNG o WebP y no superar ${materialImageMaxMb} MB.` });
@@ -1456,6 +1470,11 @@ app.put('/api/materiales/:id', async (request, response) => {
       return response.status(400).json({ message: 'Nombre, categoría y unidad son obligatorios.' });
     }
 
+    if (!isLabor && (!hasMarca || !hasCosto || !hasStockMinimo || !imagen)) {
+      await connection.rollback();
+      return response.status(400).json({ message: 'Marca, imagen, costo unitario y stock mínimo son obligatorios.' });
+    }
+
     const [result] = await connection.execute(
       `UPDATE materiales
           SET id_usuario = ?, id_categoria = ?, codigo = ?, nombre = ?, marca = ?, color = ?, codigo_color = ?, tipo = ?, rendimiento_m2_gal = ?, precio_unitario = ?, precio_venta = ?, unidad_medida = ?, descripcion = ?, imagen = ?
@@ -1467,7 +1486,6 @@ app.put('/api/materiales/:id', async (request, response) => {
       return response.status(404).json({ message: 'Material no encontrado.' });
     }
 
-    const isLabor = String(materialTipo || '').trim().toLowerCase() === 'mano de obra';
     const [inventoryResult] = isLabor
       ? [{ affectedRows: 1 }]
       : await connection.execute(
