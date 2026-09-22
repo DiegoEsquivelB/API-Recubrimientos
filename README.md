@@ -83,6 +83,8 @@ COOKIE_SECURE=false
 SESSION_COOKIE_NAME=recubrimientos_session
 ```
 
+El límite de imagen de materiales es de 5 MB por defecto. Puede modificarse con la variable `MATERIAL_IMAGE_MAX_MB`; el límite JSON del API se ajusta automáticamente para admitir la imagen codificada en Base64.
+
 > `FRONTEND_URL` puede recibir varios orígenes separados por comas.
 
 ## Base de datos
