@@ -1230,6 +1230,29 @@ app.delete('/api/materiales/categorias/:id', requireAdministratorForDelete, asyn
   }
 });
 
+app.get('/api/materiales/:id/variaciones', async (request, response) => {
+  try {
+    const [rows] = await pool.execute(`
+      SELECT
+        m.id_material AS id,
+        m.nombre,
+        m.color,
+        m.codigo_color
+      FROM materiales actual
+      JOIN materiales m
+        ON m.marca <=> actual.marca
+        AND m.tipo = actual.tipo
+        AND m.descripcion <=> actual.descripcion
+        AND m.estado = 'Activo'
+      WHERE actual.id_material = ?
+      ORDER BY m.id_material ASC
+    `, [request.params.id]);
+    response.json(rows);
+  } catch (_error) {
+    response.status(500).json({ message: 'No fue posible consultar las variaciones de color.' });
+  }
+});
+
 app.get('/api/materiales/:id', async (request, response) => {
   try {
     await ensureMaterialCategorySupport();
@@ -1286,6 +1309,7 @@ app.post('/api/materiales', async (request, response) => {
     marca,
     color,
     codigo_color,
+    variaciones,
     id_usuario,
     usuario_id,
     usuario,
@@ -1318,7 +1342,6 @@ app.post('/api/materiales', async (request, response) => {
     await connection.beginTransaction();
     const finalUserId = await resolveValidUserId(connection, sessionUserId, requestedUserId);
     const categoryId = await resolveMaterialCategoryId(connection, id_categoria ?? categoria_id ?? categoria ?? tipo, materialTipo);
-    const finalCodigo = await generateMaterialCode(connection, categoryId ?? (id_categoria ?? categoria_id ?? categoria ?? tipo), materialTipo);
 
     if (!nombre || !materialTipo || !unidadMedida) {
       await connection.rollback();
@@ -1330,28 +1353,42 @@ app.post('/api/materiales', async (request, response) => {
       return response.status(400).json({ message: 'La cantidad inicial debe ser mayor a cero.' });
     }
 
-    const [result] = await connection.execute(
-      'INSERT INTO materiales (id_usuario, id_categoria, codigo, nombre, marca, color, codigo_color, tipo, rendimiento_m2_gal, precio_unitario, precio_venta, unidad_medida, descripcion, imagen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [finalUserId, categoryId, finalCodigo, nombre, marca || null, color || null, codigo_color || null, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, unidadMedida, descripcion || null, imagen || null]
-    );
-    if (!isLabor) {
-      await connection.execute(
-        'INSERT INTO inventario (id_usuario, id_material, stock_actual, stock_minimo) VALUES (?, ?, 0, ?)',
-        [finalUserId, result.insertId, stockMinimo]
-      );
-    }
+    const variationList = Array.isArray(variaciones) && variaciones.length
+      ? variaciones
+      : [{ color, codigo_color }];
+    const createdIds = [];
 
-    if (shouldRegisterInventory) {
-      await applyInventoryDelta(connection, result.insertId, 'Entrada', initialStock, 1, Number(precioUnitario));
-      await connection.execute(
-        'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
-        [result.insertId, finalUserId, 'Entrada', initialStock, referencia_inventario || 'Inventario inicial', 'Registro creado desde materiales']
+    for (const variation of variationList) {
+      const variationColor = String(variation?.color || '').trim() || null;
+      const variationCode = String(variation?.codigo_color || '').trim() || null;
+      const variationName = variationColor ? `${nombre} - ${variationColor}` : nombre;
+      const finalCodigo = await generateMaterialCode(connection, categoryId ?? (id_categoria ?? categoria_id ?? categoria ?? tipo), materialTipo);
+      const [result] = await connection.execute(
+        'INSERT INTO materiales (id_usuario, id_categoria, codigo, nombre, marca, color, codigo_color, tipo, rendimiento_m2_gal, precio_unitario, precio_venta, unidad_medida, descripcion, imagen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [finalUserId, categoryId, finalCodigo, variationName, marca || null, variationColor, variationCode, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, unidadMedida, descripcion || null, imagen || null]
       );
+      createdIds.push(result.insertId);
+      if (!isLabor) {
+        await connection.execute(
+          'INSERT INTO inventario (id_usuario, id_material, stock_actual, stock_minimo) VALUES (?, ?, 0, ?)',
+          [finalUserId, result.insertId, stockMinimo]
+        );
+      }
+
+      if (shouldRegisterInventory) {
+        await applyInventoryDelta(connection, result.insertId, 'Entrada', initialStock, 1, Number(precioUnitario));
+        await connection.execute(
+          'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
+          [result.insertId, finalUserId, 'Entrada', initialStock, referencia_inventario || 'Inventario inicial', 'Registro creado desde materiales']
+        );
+      }
     }
 
     await connection.commit();
     response.status(201).json({
-      id: result.insertId,
+      ids: createdIds,
+      id: createdIds[0],
+      variaciones_creadas: createdIds.length,
       message: shouldRegisterInventory
         ? 'Material guardado y entrada inicial registrada correctamente.'
         : 'Material guardado correctamente.'
