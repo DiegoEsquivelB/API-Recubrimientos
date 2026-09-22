@@ -209,6 +209,7 @@ Las categorías iniciales (`Pintura`, `Sellador`, `Esmalte`, `Impermeabilizante`
 ## Funcionalidades relevantes
 
 - catálogo de materiales con código, categoría, imagen y estado activo/archivado
+- materiales de pintura con color de variación y descripción compartida desde el frontend
 - inventario con control de stock y lotes por PEPS
 - cálculo de costo por salida con base en lotes más antiguos
 - proyectos con materiales asignados, costos y detalle PEPS

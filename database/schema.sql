@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS materiales (
   id_categoria INT NULL,
   codigo VARCHAR(20) NOT NULL UNIQUE,
   nombre VARCHAR(100) NOT NULL,
+  color VARCHAR(60) NULL,
+  codigo_color VARCHAR(7) NULL,
   tipo VARCHAR(60) NOT NULL,
   rendimiento_m2_gal DECIMAL(10,2) NOT NULL DEFAULT 35.00,
   precio_unitario DECIMAL(10,2) NOT NULL,

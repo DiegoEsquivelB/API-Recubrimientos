@@ -350,6 +350,18 @@ async function ensureMaterialCategorySupport() {
   }
 
   try {
+    await pool.query('ALTER TABLE materiales ADD COLUMN color VARCHAR(60) NULL AFTER nombre');
+  } catch (_error) {
+    // Existing installations may already have the column.
+  }
+
+  try {
+    await pool.query('ALTER TABLE materiales ADD COLUMN codigo_color VARCHAR(7) NULL AFTER color');
+  } catch (_error) {
+    // Existing installations may already have the column.
+  }
+
+  try {
     await pool.query("ALTER TABLE materiales ADD COLUMN estado ENUM('Activo', 'Archivado') NOT NULL DEFAULT 'Activo'");
   } catch (_error) {
     // Existing installations may already have this column.
@@ -1105,6 +1117,8 @@ app.get('/api/materiales', async (request, response) => {
         m.id_material,
         m.codigo,
         m.nombre,
+        m.color,
+        m.codigo_color,
         m.tipo AS categoria,
         m.tipo,
         m.unidad_medida AS unidad,
@@ -1218,6 +1232,8 @@ app.get('/api/materiales/:id', async (request, response) => {
         m.id_material,
         m.codigo,
         m.nombre,
+        m.color,
+        m.codigo_color,
         m.tipo AS categoria,
         m.tipo,
         m.unidad_medida AS unidad,
@@ -1259,6 +1275,8 @@ app.post('/api/materiales', async (request, response) => {
     stock_inicial,
     referencia_inventario,
     descripcion,
+    color,
+    codigo_color,
     id_usuario,
     usuario_id,
     usuario,
@@ -1304,8 +1322,8 @@ app.post('/api/materiales', async (request, response) => {
     }
 
     const [result] = await connection.execute(
-      'INSERT INTO materiales (id_usuario, id_categoria, codigo, nombre, tipo, rendimiento_m2_gal, precio_unitario, precio_venta, unidad_medida, descripcion, imagen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [finalUserId, categoryId, finalCodigo, nombre, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, unidadMedida, descripcion || null, imagen || null]
+      'INSERT INTO materiales (id_usuario, id_categoria, codigo, nombre, color, codigo_color, tipo, rendimiento_m2_gal, precio_unitario, precio_venta, unidad_medida, descripcion, imagen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [finalUserId, categoryId, finalCodigo, nombre, color || null, codigo_color || null, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, unidadMedida, descripcion || null, imagen || null]
     );
     if (!isLabor) {
       await connection.execute(
@@ -1343,7 +1361,7 @@ app.post('/api/materiales', async (request, response) => {
 });
 
 app.put('/api/materiales/:id', async (request, response) => {
-  const { codigo, nombre, categoria, tipo, unidad, unidad_medida, rendimiento, rendimiento_m2_gal, costo, precio_unitario, precio_venta, stock_minimo, descripcion, id_usuario, usuario_id, usuario, id_categoria, categoria_id, imagen } = request.body;
+  const { codigo, nombre, color, codigo_color, categoria, tipo, unidad, unidad_medida, rendimiento, rendimiento_m2_gal, costo, precio_unitario, precio_venta, stock_minimo, descripcion, id_usuario, usuario_id, usuario, id_categoria, categoria_id, imagen } = request.body;
   const materialTipo = categoria || tipo;
   const unidadMedida = unidad || unidad_medida || 'Galón';
   const rendimientoMaterial = Number(rendimiento ?? rendimiento_m2_gal ?? 0);
@@ -1379,9 +1397,9 @@ app.put('/api/materiales/:id', async (request, response) => {
 
     const [result] = await connection.execute(
       `UPDATE materiales
-      SET id_usuario = ?, id_categoria = ?, codigo = ?, nombre = ?, tipo = ?, rendimiento_m2_gal = ?, precio_unitario = ?, precio_venta = ?, unidad_medida = ?, descripcion = ?, imagen = ?
+          SET id_usuario = ?, id_categoria = ?, codigo = ?, nombre = ?, color = ?, codigo_color = ?, tipo = ?, rendimiento_m2_gal = ?, precio_unitario = ?, precio_venta = ?, unidad_medida = ?, descripcion = ?, imagen = ?
        WHERE id_material = ?`,
-          [finalUserId, categoryId, finalCodigo, nombre, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, unidadMedida, descripcion || null, imagen || null, request.params.id]
+            [finalUserId, categoryId, finalCodigo, nombre, color || null, codigo_color || null, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, unidadMedida, descripcion || null, imagen || null, request.params.id]
     );
     if (result.affectedRows === 0) {
       await connection.rollback();
