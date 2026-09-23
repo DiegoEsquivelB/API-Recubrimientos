@@ -163,6 +163,22 @@ CREATE TABLE IF NOT EXISTS proyecto_herramientas (
   FOREIGN KEY (id_material) REFERENCES materiales(id_material)
 );
 
+CREATE TABLE IF NOT EXISTS herramienta_unidades (
+  id_unidad INT AUTO_INCREMENT PRIMARY KEY,
+  id_material INT NOT NULL,
+  usos_iniciales INT NOT NULL,
+  usos_disponibles INT NOT NULL,
+  id_asignacion_actual INT NULL,
+  estado ENUM('Disponible', 'Baja') NOT NULL DEFAULT 'Disponible',
+  origen_movimiento_id INT NULL,
+  baja_movimiento_id INT NULL,
+  fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_herramienta_unidades_material (id_material, estado, usos_disponibles),
+  INDEX idx_herramienta_unidades_asignacion (id_asignacion_actual),
+  FOREIGN KEY (id_material) REFERENCES materiales(id_material) ON DELETE CASCADE,
+  FOREIGN KEY (id_asignacion_actual) REFERENCES proyecto_herramientas(id_asignacion) ON DELETE SET NULL
+);
+
 CREATE OR REPLACE VIEW vw_stock_materiales AS
 SELECT
   m.id_material,

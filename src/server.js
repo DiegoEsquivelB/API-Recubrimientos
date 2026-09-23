@@ -8,6 +8,7 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
+const { proportionalToolCost } = require('./toolUsage');
 const sessionCookieName = process.env.SESSION_COOKIE_NAME || 'recubrimientos_session';
 const sessionSecret = process.env.SESSION_SECRET || 'recubrimientos-dev-session-secret';
 const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 8);
@@ -345,6 +346,12 @@ async function ensureMaterialCategorySupport() {
     }
   }
 
+  await pool.query(`
+    UPDATE materiales SET precio_uso = ROUND(precio_unitario / GREATEST(usos_estimados, 1), 2)
+    WHERE modo_uso = 'Reutilizable'
+      AND precio_uso <> ROUND(precio_unitario / GREATEST(usos_estimados, 1), 2)
+  `);
+
   if (salePriceAdded) {
     try {
       await pool.query('UPDATE materiales SET precio_venta = precio_unitario WHERE precio_venta = 0 AND precio_unitario > 0');
@@ -555,6 +562,24 @@ async function ensureProjectSupport() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS herramienta_unidades (
+      id_unidad INT AUTO_INCREMENT PRIMARY KEY,
+      id_material INT NOT NULL,
+      usos_iniciales INT NOT NULL,
+      usos_disponibles INT NOT NULL,
+      id_asignacion_actual INT NULL,
+      estado ENUM('Disponible', 'Baja') NOT NULL DEFAULT 'Disponible',
+      origen_movimiento_id INT NULL,
+      baja_movimiento_id INT NULL,
+      fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_herramienta_unidades_material (id_material, estado, usos_disponibles),
+      INDEX idx_herramienta_unidades_asignacion (id_asignacion_actual),
+      FOREIGN KEY (id_material) REFERENCES materiales(id_material) ON DELETE CASCADE,
+      FOREIGN KEY (id_asignacion_actual) REFERENCES proyecto_herramientas(id_asignacion) ON DELETE SET NULL
+    )
+  `);
+
   try {
     await pool.query('ALTER TABLE proyecto_materiales ADD COLUMN detalle_peps LONGTEXT NULL AFTER costo_subtotal');
   } catch (_error) {
@@ -684,6 +709,70 @@ async function upsertProjectMaterialRelations(connection, projectId, materiales 
   await syncProjectMaterialSummary(connection, projectId);
 }
 
+async function ensureToolUnitsForMaterial(connection, materialId) {
+  const [materials] = await connection.execute(`
+    SELECT m.modo_uso, m.estado, m.usos_estimados, m.precio_unitario, i.stock_actual
+    FROM materiales m JOIN inventario i ON i.id_material = m.id_material
+    WHERE m.id_material = ? FOR UPDATE
+  `, [materialId]);
+  const material = materials[0];
+  if (!material || material.modo_uso !== 'Reutilizable') return null;
+  const stock = Number(material.stock_actual);
+  if (!Number.isInteger(stock) || stock < 0) {
+    throw Object.assign(new Error('Las herramientas reutilizables requieren existencias enteras.'), { statusCode: 409 });
+  }
+  const [unitRows] = await connection.execute(`
+    SELECT id_unidad FROM herramienta_unidades
+    WHERE id_material = ? AND estado = 'Disponible' FOR UPDATE
+  `, [materialId]);
+  if (unitRows.length > stock) {
+    throw Object.assign(new Error('Las unidades de la herramienta no coinciden con el inventario.'), { statusCode: 409 });
+  }
+  for (let index = unitRows.length; index < stock; index += 1) {
+    await connection.execute(`
+      INSERT INTO herramienta_unidades (id_material, usos_iniciales, usos_disponibles)
+      VALUES (?, ?, ?)
+    `, [materialId, material.usos_estimados, material.usos_estimados]);
+  }
+  const [legacyAssignments] = await connection.execute(`
+    SELECT ph.id_asignacion, ph.cantidad - ph.devueltas - ph.dadas_baja AS pendientes
+    FROM proyecto_herramientas ph
+    WHERE ph.id_material = ? AND ph.cantidad > ph.devueltas + ph.dadas_baja
+    ORDER BY ph.id_asignacion FOR UPDATE
+  `, [materialId]);
+  for (const assignment of legacyAssignments) {
+    const [mapped] = await connection.execute(`
+      SELECT COUNT(*) AS total FROM herramienta_unidades WHERE id_asignacion_actual = ?
+    `, [assignment.id_asignacion]);
+    const missing = Number(assignment.pendientes) - Number(mapped[0].total);
+    if (missing <= 0) continue;
+    const [free] = await connection.execute(`
+      SELECT id_unidad, usos_disponibles FROM herramienta_unidades
+      WHERE id_material = ? AND estado = 'Disponible' AND id_asignacion_actual IS NULL
+      ORDER BY usos_disponibles ASC, id_unidad ASC LIMIT ? FOR UPDATE
+    `, [materialId, missing]);
+    if (free.length < missing) {
+      throw Object.assign(new Error('Hay más préstamos registrados que unidades en inventario.'), { statusCode: 409 });
+    }
+    for (const unit of free) {
+      await connection.execute(`
+        UPDATE herramienta_unidades SET usos_disponibles = GREATEST(usos_disponibles - 1, 0),
+          id_asignacion_actual = ? WHERE id_unidad = ?
+      `, [assignment.id_asignacion, unit.id_unidad]);
+    }
+  }
+  return material;
+}
+
+async function addToolUnits(connection, materialId, quantity, uses, movementId = null) {
+  for (let index = 0; index < quantity; index += 1) {
+    await connection.execute(`
+      INSERT INTO herramienta_unidades (id_material, usos_iniciales, usos_disponibles, origen_movimiento_id)
+      VALUES (?, ?, ?, ?)
+    `, [materialId, uses, uses, movementId]);
+  }
+}
+
 async function assignProjectTools(connection, projectId, tools = []) {
   if (!Array.isArray(tools)) throw Object.assign(new Error('La lista de herramientas no es válida.'), { statusCode: 400 });
   for (const tool of tools) {
@@ -692,30 +781,35 @@ async function assignProjectTools(connection, projectId, tools = []) {
     if (!Number.isInteger(materialId) || materialId < 1 || !Number.isInteger(quantity) || quantity < 1) {
       throw Object.assign(new Error('Seleccione una herramienta y una cantidad válida.'), { statusCode: 400 });
     }
-    const [rows] = await connection.execute(`
-      SELECT m.precio_unitario, m.precio_uso, m.usos_estimados, i.stock_actual
-      FROM materiales m JOIN inventario i ON i.id_material = m.id_material
-      WHERE m.id_material = ? AND m.modo_uso = 'Reutilizable' AND m.estado = 'Activo'
-      FOR UPDATE
-    `, [materialId]);
-    if (!rows[0]) throw Object.assign(new Error('La herramienta seleccionada no está disponible.'), { statusCode: 400 });
-    const [loanRows] = await connection.execute(`
-      SELECT COALESCE(SUM(cantidad - devueltas - dadas_baja), 0) AS prestadas
-      FROM proyecto_herramientas WHERE id_material = ?
-    `, [materialId]);
-    const available = Number(rows[0].stock_actual) - Number(loanRows[0]?.prestadas ?? 0);
-    if (quantity > available) throw Object.assign(new Error(`Solo hay ${available} unidades disponibles de la herramienta.`), { statusCode: 409 });
-    const cost = Number((quantity * Number(rows[0].precio_unitario) / Number(rows[0].usos_estimados || 1)).toFixed(2));
-    const price = Number((quantity * Number(rows[0].precio_uso || 0)).toFixed(2));
-    await connection.execute(`
+    const material = await ensureToolUnitsForMaterial(connection, materialId);
+    if (!material || material.estado !== 'Activo') {
+      throw Object.assign(new Error('La herramienta seleccionada no está disponible.'), { statusCode: 400 });
+    }
+    const [units] = await connection.execute(`
+      SELECT id_unidad, usos_iniciales FROM herramienta_unidades
+      WHERE id_material = ? AND estado = 'Disponible' AND id_asignacion_actual IS NULL AND usos_disponibles > 0
+      ORDER BY usos_disponibles ASC, id_unidad ASC LIMIT ? FOR UPDATE
+    `, [materialId, quantity]);
+    if (units.length < quantity) {
+      throw Object.assign(new Error(`Solo hay ${units.length} unidades con usos disponibles.`), { statusCode: 409 });
+    }
+    const charge = Number(units.reduce((sum, unit) => sum + proportionalToolCost(material.precio_unitario, unit.usos_iniciales), 0).toFixed(2));
+    const [result] = await connection.execute(`
       INSERT INTO proyecto_herramientas (id_proyecto, id_material, cantidad, costo_uso, precio_uso)
       VALUES (?, ?, ?, ?, ?)
-    `, [projectId, materialId, quantity, cost, price]);
+    `, [projectId, materialId, quantity, charge, charge]);
+    for (const unit of units) {
+      await connection.execute(`
+        UPDATE herramienta_unidades
+        SET usos_disponibles = usos_disponibles - 1, id_asignacion_actual = ?
+        WHERE id_unidad = ?
+      `, [result.insertId, unit.id_unidad]);
+    }
   }
   await syncProjectMaterialSummary(connection, projectId);
 }
 
-async function applyInventoryDelta(connection, materialId, tipo, cantidad, direction = 1, unitCost = null, allowLoanedLoss = false) {
+async function applyInventoryDelta(connection, materialId, tipo, cantidad, direction = 1, unitCost = null, allowLoanedLoss = false, movementId = null, lostUnitIds = null) {
   const normalizedType = String(tipo || '').toLowerCase();
   const movementQuantity = Number(cantidad);
   if (!materialId || !Number.isFinite(movementQuantity) || movementQuantity <= 0) {
@@ -737,10 +831,15 @@ async function applyInventoryDelta(connection, materialId, tipo, cantidad, direc
   }
 
   const [materialRows] = await connection.execute(
-    'SELECT precio_unitario FROM materiales WHERE id_material = ? LIMIT 1',
+    'SELECT precio_unitario, modo_uso, usos_estimados FROM materiales WHERE id_material = ? LIMIT 1',
     [materialId]
   );
   const defaultCost = Number(unitCost ?? materialRows[0]?.precio_unitario ?? 0);
+  const reusable = materialRows[0]?.modo_uso === 'Reutilizable';
+  if (reusable && !Number.isInteger(movementQuantity)) {
+    throw Object.assign(new Error('La cantidad de herramientas debe ser un número entero.'), { statusCode: 400 });
+  }
+  if (reusable) await ensureToolUnitsForMaterial(connection, materialId);
 
   const [lotRows] = await connection.execute(
     'SELECT id_lote, cantidad_disponible, costo_unitario FROM inventario_lotes WHERE id_material = ? AND cantidad_disponible > 0 ORDER BY id_lote ASC FOR UPDATE',
@@ -757,6 +856,54 @@ async function applyInventoryDelta(connection, materialId, tipo, cantidad, direc
   const isSalida = normalizedType === 'salida';
   const effectiveSalida = isSalida === (direction === 1);
   if (effectiveSalida) {
+    let unitsToRetire = [];
+    let removeOriginUnits = false;
+    if (reusable) {
+      if (allowLoanedLoss) {
+        if (!Array.isArray(lostUnitIds) || lostUnitIds.length !== movementQuantity
+          || new Set(lostUnitIds.map(Number)).size !== movementQuantity) {
+          throw Object.assign(new Error('No se identificaron las unidades dadas de baja.'), { statusCode: 409 });
+        }
+        const [loanedUnits] = await connection.execute(`
+          SELECT id_unidad FROM herramienta_unidades
+          WHERE id_material = ? AND estado = 'Disponible' AND id_asignacion_actual IS NOT NULL FOR UPDATE
+        `, [materialId]);
+        const loanedIds = new Set(loanedUnits.map((unit) => Number(unit.id_unidad)));
+        if (lostUnitIds.some((id) => !loanedIds.has(Number(id)))) {
+          throw Object.assign(new Error('Una unidad ya no está prestada.'), { statusCode: 409 });
+        }
+        unitsToRetire = lostUnitIds;
+      } else {
+        const [freeUnits] = await connection.execute(`
+          SELECT id_unidad, usos_iniciales, usos_disponibles FROM herramienta_unidades
+          WHERE id_material = ? AND estado = 'Disponible' AND id_asignacion_actual IS NULL
+          ORDER BY usos_disponibles ASC, id_unidad ASC LIMIT ? FOR UPDATE
+        `, [materialId, movementQuantity]);
+        if (freeUnits.length < movementQuantity) {
+          throw Object.assign(new Error('No hay suficientes herramientas libres para esta salida.'), { statusCode: 409 });
+        }
+        if (direction === -1 && movementId) {
+          const [originUnits] = await connection.execute(`
+            SELECT id_unidad, usos_iniciales, usos_disponibles, estado, id_asignacion_actual
+            FROM herramienta_unidades
+            WHERE id_material = ? AND origen_movimiento_id = ? FOR UPDATE
+          `, [materialId, movementId]);
+          if (originUnits.length) {
+            if (originUnits.length !== movementQuantity || originUnits.some((unit) => unit.estado !== 'Disponible' || unit.id_asignacion_actual !== null || Number(unit.usos_disponibles) !== Number(unit.usos_iniciales))) {
+              throw Object.assign(new Error('No se puede revertir una entrada cuyas herramientas ya se usaron.'), { statusCode: 409 });
+            }
+            unitsToRetire = originUnits.map((unit) => unit.id_unidad);
+            removeOriginUnits = true;
+          } else {
+            const [history] = await connection.execute('SELECT COUNT(*) AS total FROM proyecto_herramientas WHERE id_material = ?', [materialId]);
+            if (Number(history[0].total) > 0 || freeUnits.some((unit) => Number(unit.usos_disponibles) !== Number(unit.usos_iniciales))) {
+              throw Object.assign(new Error('No se puede revertir esta entrada antigua porque la herramienta ya tuvo uso.'), { statusCode: 409 });
+            }
+          }
+        }
+        if (!unitsToRetire.length) unitsToRetire = freeUnits.map((unit) => unit.id_unidad);
+      }
+    }
     if (!allowLoanedLoss) {
       const [loanRows] = await connection.execute(`
         SELECT COALESCE(SUM(cantidad - devueltas - dadas_baja), 0) AS prestadas
@@ -797,6 +944,16 @@ async function applyInventoryDelta(connection, materialId, tipo, cantidad, direc
       'UPDATE inventario SET stock_actual = stock_actual - ? WHERE id_material = ?',
       [movementQuantity, materialId]
     );
+    for (const unitId of unitsToRetire) {
+      if (removeOriginUnits) {
+        await connection.execute('DELETE FROM herramienta_unidades WHERE id_unidad = ?', [unitId]);
+      } else {
+        await connection.execute(`
+          UPDATE herramienta_unidades SET estado = 'Baja', id_asignacion_actual = NULL,
+            baja_movimiento_id = ? WHERE id_unidad = ?
+        `, [movementId, unitId]);
+      }
+    }
     return { costo: cost, detalle };
   }
 
@@ -808,6 +965,29 @@ async function applyInventoryDelta(connection, materialId, tipo, cantidad, direc
     'UPDATE inventario SET stock_actual = stock_actual + ? WHERE id_material = ?',
     [movementQuantity, materialId]
   );
+  if (reusable) {
+    let restored = 0;
+    if (direction === -1 && movementId) {
+      const [retiredUnits] = await connection.execute(`
+        SELECT id_unidad FROM herramienta_unidades
+        WHERE id_material = ? AND baja_movimiento_id = ? AND estado = 'Baja'
+        FOR UPDATE
+      `, [materialId, movementId]);
+      if (retiredUnits.length && retiredUnits.length !== movementQuantity) {
+        throw Object.assign(new Error('No se pueden restaurar parcialmente las unidades de esta salida.'), { statusCode: 409 });
+      }
+      for (const unit of retiredUnits) {
+        await connection.execute(`
+          UPDATE herramienta_unidades SET estado = 'Disponible', baja_movimiento_id = NULL
+          WHERE id_unidad = ?
+        `, [unit.id_unidad]);
+      }
+      restored = retiredUnits.length;
+    }
+    if (restored < movementQuantity) {
+      await addToolUnits(connection, materialId, movementQuantity - restored, Number(materialRows[0].usos_estimados), movementId);
+    }
+  }
   return { costo: Number((movementQuantity * defaultCost).toFixed(2)), detalle: [] };
 }
 
@@ -1404,7 +1584,6 @@ app.post('/api/materiales', async (request, response) => {
     precio_venta,
     modo_uso,
     usos_estimados,
-    precio_uso,
     stock_minimo,
     registrar_inventario,
     stock_inicial,
@@ -1430,7 +1609,6 @@ app.post('/api/materiales', async (request, response) => {
     : Number(precio_venta);
   const modoUso = modo_uso === 'Reutilizable' ? 'Reutilizable' : 'Consumible';
   const usosEstimados = Number(usos_estimados ?? 1);
-  const precioUso = Number(precio_uso ?? 0);
   const stockMinimo = stock_minimo || 0;
   const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
   const requestedUserId = id_usuario || usuario_id || usuario || null;
@@ -1451,6 +1629,7 @@ app.post('/api/materiales', async (request, response) => {
 
   await ensureMaterialCategorySupport();
   await ensureInventorySupport();
+  await ensureProjectSupport();
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
@@ -1462,9 +1641,11 @@ app.post('/api/materiales', async (request, response) => {
       return response.status(400).json({ message: 'Nombre, categoría y unidad son obligatorios.' });
     }
 
-    if (modoUso === 'Reutilizable' && (isLabor || !Number.isInteger(usosEstimados) || usosEstimados < 1 || !Number.isFinite(precioUso) || precioUso < 0 || variationList.length > 1)) {
+    if (modoUso === 'Reutilizable' && (isLabor || !Number.isInteger(usosEstimados) || usosEstimados < 1
+      || !Number.isFinite(precioUnitario) || precioUnitario < 0 || variationList.length > 1
+      || variationList.some((variation) => !Number.isInteger(Number(variation?.stock_inicial ?? initialStock)) || Number(variation?.stock_inicial ?? initialStock) < 1))) {
       await connection.rollback();
-      return response.status(400).json({ message: 'La herramienta requiere usos estimados válidos y no admite variaciones de color.' });
+      return response.status(400).json({ message: 'La herramienta requiere costo, usos estimados y cantidad inicial entera, y no admite variaciones de color.' });
     }
 
     if (!isLabor && (!hasMarca || !hasCosto || !hasStockMinimo || !imagen)) {
@@ -1494,7 +1675,7 @@ app.post('/api/materiales', async (request, response) => {
       generatedCodes.add(finalCodigo);
       const [result] = await connection.execute(
         'INSERT INTO materiales (id_usuario, id_categoria, codigo, nombre, marca, color, codigo_color, tipo, rendimiento_m2_gal, precio_unitario, precio_venta, modo_uso, usos_estimados, precio_uso, unidad_medida, descripcion, imagen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [finalUserId, categoryId, finalCodigo, variationName, marca || null, variationColor, variationCode, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, modoUso, usosEstimados, precioUso, unidadMedida, descripcion || null, imagen || null]
+        [finalUserId, categoryId, finalCodigo, variationName, marca || null, variationColor, variationCode, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, modoUso, usosEstimados, modoUso === 'Reutilizable' ? Number((precioUnitario / usosEstimados).toFixed(2)) : 0, unidadMedida, descripcion || null, imagen || null]
       );
       createdIds.push(result.insertId);
       if (!isLabor) {
@@ -1506,11 +1687,11 @@ app.post('/api/materiales', async (request, response) => {
 
       if (shouldRegisterInventory) {
         const variationStock = Number(variation?.stock_inicial ?? initialStock);
-        await applyInventoryDelta(connection, result.insertId, 'Entrada', variationStock, 1, Number(precioUnitario));
-        await connection.execute(
+        const [movement] = await connection.execute(
           'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas) VALUES (?, ?, ?, CURDATE(), ?, ?, ?)',
           [result.insertId, finalUserId, 'Entrada', variationStock, referencia_inventario || 'Inventario inicial', 'Registro creado desde materiales']
         );
+        await applyInventoryDelta(connection, result.insertId, 'Entrada', variationStock, 1, Number(precioUnitario), false, movement.insertId);
       }
     }
 
@@ -1537,7 +1718,7 @@ app.post('/api/materiales', async (request, response) => {
 });
 
 app.put('/api/materiales/:id', async (request, response) => {
-  const { codigo, nombre, marca, color, codigo_color, categoria, tipo, unidad, unidad_medida, rendimiento, rendimiento_m2_gal, costo, precio_unitario, precio_venta, modo_uso, usos_estimados, precio_uso, stock_minimo, descripcion, id_usuario, usuario_id, usuario, id_categoria, categoria_id, imagen } = request.body;
+  const { codigo, nombre, marca, color, codigo_color, categoria, tipo, unidad, unidad_medida, rendimiento, rendimiento_m2_gal, costo, precio_unitario, precio_venta, modo_uso, usos_estimados, stock_minimo, descripcion, id_usuario, usuario_id, usuario, id_categoria, categoria_id, imagen } = request.body;
   const materialTipo = categoria || tipo;
   const unidadMedida = unidad || unidad_medida || 'Galón';
   const rendimientoMaterial = Number(rendimiento ?? rendimiento_m2_gal ?? 0);
@@ -1547,7 +1728,6 @@ app.put('/api/materiales/:id', async (request, response) => {
     : Number(precio_venta);
   let modoUso = modo_uso === 'Reutilizable' ? 'Reutilizable' : 'Consumible';
   const usosEstimados = Number(usos_estimados ?? 1);
-  const precioUso = Number(precio_uso ?? 0);
   const stockMinimo = stock_minimo || 0;
   const sessionUserId = getSessionFromRequest(request)?.sub ?? null;
   const requestedUserId = id_usuario || usuario_id || usuario || null;
@@ -1568,12 +1748,11 @@ app.put('/api/materiales/:id', async (request, response) => {
     await connection.beginTransaction();
     const finalUserId = await resolveValidUserId(connection, sessionUserId, requestedUserId);
     const [currentMaterial] = await connection.execute(
-      'SELECT codigo, modo_uso, usos_estimados, precio_uso FROM materiales WHERE id_material = ? LIMIT 1',
+      'SELECT codigo, modo_uso, usos_estimados FROM materiales WHERE id_material = ? LIMIT 1',
       [request.params.id]
     );
     if (modo_uso === undefined) modoUso = currentMaterial[0]?.modo_uso || 'Consumible';
     const finalUsosEstimados = usos_estimados === undefined ? Number(currentMaterial[0]?.usos_estimados || 1) : usosEstimados;
-    const finalPrecioUso = precio_uso === undefined ? Number(currentMaterial[0]?.precio_uso || 0) : precioUso;
 
     const categoryId = await resolveMaterialCategoryId(connection, id_categoria ?? categoria_id ?? categoria ?? tipo, materialTipo);
     const finalCodigo = currentMaterial[0]?.codigo || "";
@@ -1583,15 +1762,23 @@ app.put('/api/materiales/:id', async (request, response) => {
       return response.status(400).json({ message: 'Nombre, categoría y unidad son obligatorios.' });
     }
 
-    if (modoUso === 'Reutilizable' && (isLabor || !Number.isInteger(finalUsosEstimados) || finalUsosEstimados < 1 || !Number.isFinite(finalPrecioUso) || finalPrecioUso < 0)) {
+    if (modoUso === 'Reutilizable' && (isLabor || !Number.isInteger(finalUsosEstimados) || finalUsosEstimados < 1 || !Number.isFinite(precioUnitario) || precioUnitario < 0)) {
       await connection.rollback();
-      return response.status(400).json({ message: 'Los usos estimados y el precio por uso deben ser válidos.' });
+      return response.status(400).json({ message: 'El costo y los usos iniciales deben ser válidos.' });
     }
     if (currentMaterial[0]?.modo_uso !== modoUso) {
       const [usageRows] = await connection.execute('SELECT (SELECT COUNT(*) FROM proyecto_materiales WHERE id_material = ?) + (SELECT COUNT(*) FROM proyecto_herramientas WHERE id_material = ?) AS total', [request.params.id, request.params.id]);
       if (Number(usageRows[0]?.total || 0) > 0) {
         await connection.rollback();
         return response.status(409).json({ message: 'No se puede cambiar el modo de uso de un artículo ya asignado a proyectos.' });
+      }
+    }
+    if (currentMaterial[0]?.modo_uso === 'Reutilizable' && modoUso === 'Reutilizable'
+      && finalUsosEstimados !== Number(currentMaterial[0].usos_estimados)) {
+      const [usageRows] = await connection.execute('SELECT COUNT(*) AS total FROM proyecto_herramientas WHERE id_material = ?', [request.params.id]);
+      if (Number(usageRows[0]?.total) > 0) {
+        await connection.rollback();
+        return response.status(409).json({ message: 'No se pueden cambiar los usos iniciales de una herramienta que ya fue asignada a proyectos.' });
       }
     }
 
@@ -1604,7 +1791,7 @@ app.put('/api/materiales/:id', async (request, response) => {
       `UPDATE materiales
           SET id_usuario = ?, id_categoria = ?, codigo = ?, nombre = ?, marca = ?, color = ?, codigo_color = ?, tipo = ?, rendimiento_m2_gal = ?, precio_unitario = ?, precio_venta = ?, modo_uso = ?, usos_estimados = ?, precio_uso = ?, unidad_medida = ?, descripcion = ?, imagen = ?
        WHERE id_material = ?`,
-            [finalUserId, categoryId, finalCodigo, nombre, marca || null, color || null, codigo_color || null, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, modoUso, finalUsosEstimados, finalPrecioUso, unidadMedida, descripcion || null, imagen || null, request.params.id]
+            [finalUserId, categoryId, finalCodigo, nombre, marca || null, color || null, codigo_color || null, materialTipo, rendimientoMaterial, precioUnitario, precioVenta, modoUso, finalUsosEstimados, modoUso === 'Reutilizable' ? Number((precioUnitario / finalUsosEstimados).toFixed(2)) : 0, unidadMedida, descripcion || null, imagen || null, request.params.id]
     );
     if (result.affectedRows === 0) {
       await connection.rollback();
@@ -1623,6 +1810,19 @@ app.put('/api/materiales/:id', async (request, response) => {
         'INSERT INTO inventario (id_usuario, id_material, stock_actual, stock_minimo) VALUES (?, ?, 0, ?)',
         [finalUserId, request.params.id, stockMinimo]
       );
+    }
+
+    if (modoUso === 'Reutilizable') {
+      if (currentMaterial[0]?.modo_uso === 'Reutilizable' && finalUsosEstimados !== Number(currentMaterial[0].usos_estimados)) {
+        await connection.execute(`
+          UPDATE herramienta_unidades SET usos_iniciales = ?, usos_disponibles = ?
+          WHERE id_material = ?
+        `, [finalUsosEstimados, finalUsosEstimados, request.params.id]);
+      }
+      await ensureToolUnitsForMaterial(connection, Number(request.params.id));
+    }
+    if (currentMaterial[0]?.modo_uso === 'Reutilizable' && modoUso !== 'Reutilizable') {
+      await connection.execute('DELETE FROM herramienta_unidades WHERE id_material = ?', [request.params.id]);
     }
 
     await connection.commit();
@@ -1891,25 +2091,38 @@ app.get('/api/proyectos/:id/materiales', async (request, response) => {
 });
 
 app.get('/api/herramientas/disponibilidad', async (_request, response) => {
+  let connection;
   try {
     await ensureMaterialCategorySupport();
     await ensureProjectSupport();
-    const [rows] = await pool.execute(`
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [materials] = await connection.execute(`
+      SELECT id_material FROM materiales WHERE modo_uso = 'Reutilizable' AND estado = 'Activo' ORDER BY id_material
+    `);
+    for (const material of materials) await ensureToolUnitsForMaterial(connection, material.id_material);
+    const [rows] = await connection.execute(`
       SELECT m.id_material, m.nombre, m.codigo, m.precio_unitario, m.precio_uso, m.usos_estimados,
              COALESCE(i.stock_actual, 0) AS stock_actual,
-             COALESCE(SUM(ph.cantidad - ph.devueltas - ph.dadas_baja), 0) AS prestadas,
-             COALESCE(i.stock_actual, 0) - COALESCE(SUM(ph.cantidad - ph.devueltas - ph.dadas_baja), 0) AS disponibles
+             COALESCE(SUM(CASE WHEN hu.estado = 'Disponible' AND hu.id_asignacion_actual IS NOT NULL THEN 1 ELSE 0 END), 0) AS prestadas,
+             COALESCE(SUM(CASE WHEN hu.estado = 'Disponible' AND hu.id_asignacion_actual IS NULL AND hu.usos_disponibles > 0 THEN 1 ELSE 0 END), 0) AS disponibles,
+             COALESCE(SUM(CASE WHEN hu.estado = 'Disponible' AND hu.id_asignacion_actual IS NULL AND hu.usos_disponibles = 0 THEN 1 ELSE 0 END), 0) AS agotadas,
+             COALESCE(SUM(CASE WHEN hu.estado = 'Disponible' THEN hu.usos_disponibles ELSE 0 END), 0) AS usos_disponibles
       FROM materiales m
       LEFT JOIN inventario i ON i.id_material = m.id_material
-      LEFT JOIN proyecto_herramientas ph ON ph.id_material = m.id_material
+      LEFT JOIN herramienta_unidades hu ON hu.id_material = m.id_material
       WHERE m.modo_uso = 'Reutilizable' AND m.estado = 'Activo'
       GROUP BY m.id_material, m.nombre, m.codigo, m.precio_unitario, m.precio_uso, m.usos_estimados, i.stock_actual
       ORDER BY m.nombre
     `);
+    await connection.commit();
     response.json(rows);
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error('Error al consultar herramientas:', error);
     response.status(500).json({ message: 'No fue posible consultar las herramientas.' });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -1955,19 +2168,44 @@ app.post('/api/proyectos/:id/herramientas/:asignacionId/movimiento', async (requ
     if (!assignment || quantity > assignment.cantidad - assignment.devueltas - assignment.dadas_baja) {
       throw Object.assign(new Error('La cantidad excede las unidades pendientes de devolución.'), { statusCode: 409 });
     }
+    await ensureToolUnitsForMaterial(connection, assignment.id_material);
+    const [loanedUnits] = await connection.execute(`
+      SELECT id_unidad, usos_iniciales, usos_disponibles FROM herramienta_unidades
+      WHERE id_asignacion_actual = ? AND estado = 'Disponible'
+      ORDER BY id_unidad LIMIT ? FOR UPDATE
+    `, [assignment.id_asignacion, quantity]);
+    if (loanedUnits.length < quantity) {
+      throw Object.assign(new Error('No se encontraron todas las unidades prestadas.'), { statusCode: 409 });
+    }
     if (type === 'Devolucion') {
+      for (const unit of loanedUnits) {
+        await connection.execute('UPDATE herramienta_unidades SET id_asignacion_actual = NULL WHERE id_unidad = ?', [unit.id_unidad]);
+      }
       await connection.execute('UPDATE proyecto_herramientas SET devueltas = devueltas + ? WHERE id_asignacion = ?', [quantity, assignment.id_asignacion]);
     } else {
-      const salida = await applyInventoryDelta(connection, assignment.id_material, 'Salida', quantity, 1, null, true);
+      const [movement] = await connection.execute(`
+        INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas)
+        VALUES (?, ?, 'Salida', CURDATE(), ?, ?, 'Herramienta dada de baja en proyecto')
+      `, [assignment.id_material, getSessionFromRequest(request)?.sub ?? null, quantity, `Proyecto #${request.params.id}`]);
+      const salida = await applyInventoryDelta(connection, assignment.id_material, 'Salida', quantity, 1, null, true, movement.insertId, loanedUnits.map((unit) => unit.id_unidad));
+      let residualCost = 0;
+      let lotIndex = 0;
+      let lotRemaining = Number(salida.detalle[0]?.cantidad || 0);
+      for (const unit of loanedUnits) {
+        let unitRemaining = 1;
+        while (unitRemaining > 0 && lotIndex < salida.detalle.length) {
+          const used = Math.min(unitRemaining, lotRemaining);
+          residualCost += used * proportionalToolCost(salida.detalle[lotIndex].costo_unitario, unit.usos_iniciales, unit.usos_disponibles);
+          unitRemaining -= used;
+          lotRemaining -= used;
+          if (lotRemaining <= 0) lotRemaining = Number(salida.detalle[++lotIndex]?.cantidad || 0);
+        }
+      }
       const replacementPrice = request.body?.cobrar_reposicion === true ? quantity * Number(materialRows[0]?.precio_venta || 0) : 0;
       await connection.execute(`
         UPDATE proyecto_herramientas SET dadas_baja = dadas_baja + ?, costo_baja = costo_baja + ?, precio_baja = precio_baja + ?
         WHERE id_asignacion = ?
-      `, [quantity, Number(salida.costo.toFixed(2)), Number(replacementPrice.toFixed(2)), assignment.id_asignacion]);
-      await connection.execute(`
-        INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, referencia, notas)
-        VALUES (?, ?, 'Salida', CURDATE(), ?, ?, 'Herramienta dada de baja en proyecto')
-      `, [assignment.id_material, getSessionFromRequest(request)?.sub ?? null, quantity, `Proyecto #${request.params.id}`]);
+      `, [quantity, Number(residualCost.toFixed(2)), Number(replacementPrice.toFixed(2)), assignment.id_asignacion]);
     }
     await syncProjectMaterialSummary(connection, Number(request.params.id));
     await connection.commit();
@@ -2327,30 +2565,53 @@ app.patch('/api/usuarios/:id/desarchivar', async (request, response) => {
 });
 
 app.get('/api/inventario', async (_request, response) => {
+  let connection;
   try {
     await ensureInventorySupport();
-    const [rows] = await pool.query(`
+    await ensureMaterialCategorySupport();
+    await ensureProjectSupport();
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [tools] = await connection.execute("SELECT id_material FROM materiales WHERE modo_uso = 'Reutilizable' ORDER BY id_material");
+    for (const tool of tools) await ensureToolUnitsForMaterial(connection, tool.id_material);
+    const [rows] = await connection.execute(`
       SELECT
         i.id_inventario AS id,
         i.id_inventario,
         i.id_material,
         m.codigo,
         m.nombre AS material_nombre,
+        m.modo_uso,
         m.unidad_medida AS unidad,
         i.stock_actual,
         i.stock_minimo,
+        COALESCE(hu.disponibles, 0) AS disponibles,
+        COALESCE(hu.agotadas, 0) AS agotadas,
+        COALESCE(hu.usos_disponibles, 0) AS usos_disponibles,
         CASE
           WHEN i.stock_actual <= i.stock_minimo THEN 'Stock mínimo'
           ELSE 'Existencia normal'
         END AS estado
       FROM inventario i
       INNER JOIN materiales m ON m.id_material = i.id_material
+      LEFT JOIN (
+        SELECT id_material,
+          SUM(CASE WHEN estado = 'Disponible' AND id_asignacion_actual IS NULL AND usos_disponibles > 0 THEN 1 ELSE 0 END) AS disponibles,
+          SUM(CASE WHEN estado = 'Disponible' AND id_asignacion_actual IS NULL AND usos_disponibles = 0 THEN 1 ELSE 0 END) AS agotadas,
+          SUM(CASE WHEN estado = 'Disponible' THEN usos_disponibles ELSE 0 END) AS usos_disponibles
+        FROM herramienta_unidades GROUP BY id_material
+      ) hu ON hu.id_material = m.id_material
       WHERE LOWER(m.tipo) <> 'mano de obra'
       ORDER BY m.nombre ASC
     `);
+    await connection.commit();
     response.json(rows);
-  } catch (_error) {
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('Error al consultar inventario:', error);
     response.status(500).json({ message: 'No fue posible consultar el inventario.' });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -2439,11 +2700,11 @@ app.post('/api/inventario/movimientos', async (request, response) => {
     }
     await connection.beginTransaction();
     const effectiveCost = Number.isFinite(unitCost) ? unitCost : null;
-    await applyInventoryDelta(connection, materialId, tipo, cantidad, 1, effectiveCost);
     const [result] = await connection.execute(
       'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, costo_unitario, referencia, notas) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [materialId, userId, tipo, fecha, cantidad, effectiveCost ?? 0, referencia || null, movementNotes || null]
     );
+    await applyInventoryDelta(connection, materialId, tipo, cantidad, 1, effectiveCost, false, result.insertId);
     await connection.commit();
     response.status(201).json({ id: result.insertId, message: 'Movimiento guardado correctamente.' });
   } catch (error) {
@@ -2472,7 +2733,7 @@ app.put('/api/inventario/movimientos/:id', async (request, response) => {
     );
     await connection.beginTransaction();
     const [rows] = await connection.execute(
-      'SELECT material_id, tipo, cantidad, costo_unitario FROM movimientos_inventario WHERE id_movimiento = ? FOR UPDATE',
+      'SELECT material_id, tipo, cantidad, costo_unitario, notas FROM movimientos_inventario WHERE id_movimiento = ? FOR UPDATE',
       [request.params.id]
     );
     if (!rows[0]) {
@@ -2480,8 +2741,12 @@ app.put('/api/inventario/movimientos/:id', async (request, response) => {
       return response.status(404).json({ message: 'Movimiento no encontrado.' });
     }
 
-    await applyInventoryDelta(connection, rows[0].material_id, rows[0].tipo, rows[0].cantidad, -1);
-    await applyInventoryDelta(connection, materialId, tipo, cantidad, 1, unitCost);
+    if (rows[0].notas === 'Herramienta dada de baja en proyecto') {
+      throw Object.assign(new Error('La baja de una herramienta del proyecto no se puede editar desde inventario.'), { statusCode: 409 });
+    }
+
+    await applyInventoryDelta(connection, rows[0].material_id, rows[0].tipo, rows[0].cantidad, -1, null, false, Number(request.params.id));
+    await applyInventoryDelta(connection, materialId, tipo, cantidad, 1, unitCost, false, Number(request.params.id));
     const [result] = await connection.execute(
       `UPDATE movimientos_inventario
       SET material_id = ?, id_usuario = ?, tipo = ?, fecha = ?, cantidad = ?, costo_unitario = ?, referencia = ?, notas = ?
@@ -2509,7 +2774,7 @@ app.delete('/api/inventario/movimientos/:id', requireAdministratorForDelete, asy
   try {
     await connection.beginTransaction();
     const [rows] = await connection.execute(
-      'SELECT material_id, tipo, cantidad FROM movimientos_inventario WHERE id_movimiento = ? FOR UPDATE',
+      'SELECT material_id, tipo, cantidad, notas FROM movimientos_inventario WHERE id_movimiento = ? FOR UPDATE',
       [request.params.id]
     );
     if (!rows[0]) {
@@ -2517,7 +2782,11 @@ app.delete('/api/inventario/movimientos/:id', requireAdministratorForDelete, asy
       return response.status(404).json({ message: 'Movimiento no encontrado.' });
     }
 
-    await applyInventoryDelta(connection, rows[0].material_id, rows[0].tipo, rows[0].cantidad, -1);
+    if (rows[0].notas === 'Herramienta dada de baja en proyecto') {
+      throw Object.assign(new Error('La baja de una herramienta del proyecto no se puede eliminar desde inventario.'), { statusCode: 409 });
+    }
+
+    await applyInventoryDelta(connection, rows[0].material_id, rows[0].tipo, rows[0].cantidad, -1, null, false, Number(request.params.id));
     const [result] = await connection.execute('DELETE FROM movimientos_inventario WHERE id_movimiento = ?', [request.params.id]);
     if (result.affectedRows === 0) {
       await connection.rollback();
