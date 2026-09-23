@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS materiales (
   rendimiento_m2_gal DECIMAL(10,2) NOT NULL DEFAULT 35.00,
   precio_unitario DECIMAL(10,2) NOT NULL,
   precio_venta DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  modo_uso ENUM('Consumible', 'Reutilizable') NOT NULL DEFAULT 'Consumible',
+  usos_estimados INT NOT NULL DEFAULT 1,
+  precio_uso DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   unidad_medida VARCHAR(20) NOT NULL DEFAULT 'Galón',
   descripcion TEXT NULL,
   imagen LONGTEXT NULL,
@@ -116,6 +119,8 @@ CREATE TABLE IF NOT EXISTS proyectos (
   estado ENUM('Pendiente', 'En proceso', 'Finalizado') NOT NULL DEFAULT 'Pendiente',
   estado_archivado ENUM('Activo', 'Archivado') NOT NULL DEFAULT 'Activo',
   costo_materiales DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  costo_herramientas DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  precio_herramientas DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   costo_mano_obra DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   precio_mano_obra DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   costo_total DECIMAL(10,2) NOT NULL DEFAULT 0.00,
@@ -140,6 +145,22 @@ CREATE TABLE IF NOT EXISTS proyecto_materiales (
   FOREIGN KEY (id_proyecto) REFERENCES proyectos(id_proyecto) ON DELETE CASCADE,
   FOREIGN KEY (id_material) REFERENCES materiales(id_material),
   FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS proyecto_herramientas (
+  id_asignacion INT AUTO_INCREMENT PRIMARY KEY,
+  id_proyecto INT NOT NULL,
+  id_material INT NOT NULL,
+  cantidad INT NOT NULL,
+  devueltas INT NOT NULL DEFAULT 0,
+  dadas_baja INT NOT NULL DEFAULT 0,
+  costo_uso DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  precio_uso DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  costo_baja DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  precio_baja DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  fecha_asignacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (id_proyecto) REFERENCES proyectos(id_proyecto) ON DELETE CASCADE,
+  FOREIGN KEY (id_material) REFERENCES materiales(id_material)
 );
 
 CREATE OR REPLACE VIEW vw_stock_materiales AS
