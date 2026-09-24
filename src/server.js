@@ -326,6 +326,11 @@ async function ensureMaterialCategorySupport() {
     // Existing installations may already include this column.
   }
 
+  await pool.query(`
+    INSERT IGNORE INTO material_categorias (nombre, prefijo_codigo)
+    VALUES ('Mano de obra', 'MDO')
+  `);
+
   let salePriceAdded = false;
   try {
     await pool.query('ALTER TABLE materiales ADD COLUMN precio_venta DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER precio_unitario');
@@ -492,6 +497,7 @@ async function ensureProjectSupport() {
     ['id_mano_obra', 'INT NULL AFTER tipo'],
     ['mano_obra_precio_m2', 'DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER id_mano_obra'],
     ['descripcion', 'TEXT NULL AFTER tipo'],
+    ['imagen', 'LONGTEXT NULL AFTER descripcion'],
     ['costo_materiales', 'DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER estado_archivado'],
     ['costo_herramientas', 'DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER costo_materiales'],
     ['precio_herramientas', 'DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER costo_herramientas'],
@@ -1469,6 +1475,11 @@ app.put('/api/materiales/categorias/:id', async (request, response) => {
       return response.status(404).json({ message: 'Categoría no encontrada.' });
     }
 
+    if ([rows[0].nombre, nombre].some((value) => String(value).trim().toLowerCase() === 'mano de obra')) {
+      await connection.rollback();
+      return response.status(409).json({ message: 'La categoría Mano de obra es parte del sistema y no se puede editar.' });
+    }
+
     const previousName = rows[0].nombre;
     const finalPrefijo = prefijoCodigo ? prefijoCodigo.replace(/[^A-Za-z]/g, '').slice(0, 10).toUpperCase() : (rows[0].prefijo_codigo || nombre.replace(/[^A-Za-z]/g, '').slice(0, 3).toUpperCase() || 'MAT');
     await connection.execute('UPDATE material_categorias SET nombre = ?, prefijo_codigo = ? WHERE id_categoria = ?', [nombre, finalPrefijo, request.params.id]);
@@ -1492,6 +1503,9 @@ app.delete('/api/materiales/categorias/:id', requireAdministratorForDelete, asyn
     await ensureMaterialCategorySupport();
     const [rows] = await pool.execute('SELECT nombre FROM material_categorias WHERE id_categoria = ?', [request.params.id]);
     if (!rows[0]) return response.status(404).json({ message: 'Categoría no encontrada.' });
+    if (String(rows[0].nombre).trim().toLowerCase() === 'mano de obra') {
+      return response.status(409).json({ message: 'La categoría Mano de obra es parte del sistema y no se puede eliminar.' });
+    }
 
     const [usedRows] = await pool.execute('SELECT COUNT(*) AS total FROM materiales WHERE tipo = ?', [rows[0].nombre]);
     if (Number(usedRows[0].total) > 0) {
@@ -1908,6 +1922,7 @@ app.get('/api/proyectos', async (request, response) => {
         p.mano_obra_precio_m2,
         mano_obra.nombre AS mano_obra_nombre,
         p.descripcion,
+        IF(p.imagen IS NOT NULL AND p.imagen <> '', 1, 0) AS tiene_imagen,
         p.estado,
         p.estado_archivado,
         p.costo_materiales,
@@ -2037,6 +2052,7 @@ app.get('/api/proyectos/:id', async (request, response) => {
         p.mano_obra_precio_m2,
         mano_obra.nombre AS mano_obra_nombre,
         p.descripcion,
+        p.imagen,
         p.estado,
         p.costo_materiales,
         p.costo_herramientas,
@@ -2070,6 +2086,20 @@ app.get('/api/proyectos/:id', async (request, response) => {
   } catch (error) {
     console.error('Error al consultar proyecto por id:', error);
     response.status(500).json({ message: 'No fue posible consultar el proyecto.' });
+  }
+});
+
+app.get('/api/proyectos/:id/imagen', async (request, response) => {
+  try {
+    await ensureProjectSupport();
+    const [rows] = await pool.execute('SELECT imagen FROM proyectos WHERE id_proyecto = ? LIMIT 1', [request.params.id]);
+    const match = String(rows[0]?.imagen || '').match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+=*)$/);
+    if (!match) return response.status(404).end();
+    response.set('Cache-Control', 'private, no-cache, must-revalidate');
+    response.type(match[1]).send(Buffer.from(match[2], 'base64'));
+  } catch (error) {
+    console.error('Error al consultar la foto del proyecto:', error);
+    response.status(500).end();
   }
 });
 
@@ -2348,7 +2378,7 @@ function normalizeProjectDate(value) {
 app.post('/api/proyectos', async (request, response) => {
   await ensureMaterialCategorySupport();
   await ensureProjectSupport();
-  const { nombre, nombre_proyecto, id_cliente, cliente_id, id_usuario, usuario_id, estado, fecha_inicio, fechaInicio, largo, area_m2, altura, tipo, id_mano_obra, presupuesto, costo_estimado, descripcion, materiales, herramientas } = request.body;
+  const { nombre, nombre_proyecto, id_cliente, cliente_id, id_usuario, usuario_id, estado, fecha_inicio, fechaInicio, largo, area_m2, altura, tipo, id_mano_obra, presupuesto, costo_estimado, descripcion, imagen, materiales, herramientas } = request.body;
   const finalNombre = nombre || nombre_proyecto;
   const finalClienteId = id_cliente || cliente_id;
   const finalUsuarioId = await resolveValidUserId(
@@ -2362,6 +2392,10 @@ app.post('/api/proyectos', async (request, response) => {
   const finalArea = area_m2 ?? (finalLargo && altura ? Number(finalLargo) * Number(altura) : 0);
   const finalDescripcion = descripcion ?? null;
   const finalEstado = 'Pendiente';
+
+  if (!isValidMaterialImage(imagen)) {
+    return response.status(400).json({ message: `La foto debe ser JPG, PNG o WebP y no superar ${materialImageMaxMb} MB.` });
+  }
 
   if (!finalNombre || !finalClienteId || !finalUsuarioId || !finalLargo || !finalArea) {
     return response.status(400).json({ message: 'Nombre, cliente, usuario, largo y área son obligatorios.' });
@@ -2384,9 +2418,9 @@ app.post('/api/proyectos', async (request, response) => {
     const finalCostoManoObra = Number((Number(finalArea) * laborPriceM2).toFixed(2));
     const finalPrecioManoObra = Number((Number(finalArea) * (laborClientPriceM2 ?? laborPriceM2)).toFixed(2));
     const [result] = await connection.execute(
-      `INSERT INTO proyectos (id_cliente, id_usuario, nombre_proyecto, largo, area_m2, altura, tipo, id_mano_obra, mano_obra_precio_m2, costo_mano_obra, precio_mano_obra, costo_total, precio_cotizacion, costo_estimado, fecha_inicio, descripcion)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [finalClienteId, finalUsuarioId, finalNombre, finalLargo || null, finalArea, altura ?? null, tipo || null, id_mano_obra || null, laborPriceM2, finalCostoManoObra, finalPrecioManoObra, finalCostoManoObra, finalPrecioManoObra, finalPresupuesto || finalPrecioManoObra, finalFechaInicio || null, finalDescripcion || null]
+      `INSERT INTO proyectos (id_cliente, id_usuario, nombre_proyecto, largo, area_m2, altura, tipo, id_mano_obra, mano_obra_precio_m2, costo_mano_obra, precio_mano_obra, costo_total, precio_cotizacion, costo_estimado, fecha_inicio, descripcion, imagen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [finalClienteId, finalUsuarioId, finalNombre, finalLargo || null, finalArea, altura ?? null, tipo || null, id_mano_obra || null, laborPriceM2, finalCostoManoObra, finalPrecioManoObra, finalCostoManoObra, finalPrecioManoObra, finalPresupuesto || finalPrecioManoObra, finalFechaInicio || null, finalDescripcion || null, imagen || null]
     );
 
     const projectId = Number(result.insertId);
@@ -2434,6 +2468,7 @@ app.put('/api/proyectos/:id', async (request, response) => {
       area_m2: incoming.area_m2 ?? currentProject.area_m2,
       altura: incoming.altura ?? currentProject.altura,
       tipo: incoming.tipo ?? currentProject.tipo,
+      imagen: incoming.imagen !== undefined ? incoming.imagen : currentProject.imagen,
       id_mano_obra: incoming.id_mano_obra ?? currentProject.id_mano_obra,
       costo_mano_obra: incoming.costo_mano_obra ?? currentProject.costo_mano_obra ?? 0,
       precio_mano_obra: incoming.precio_mano_obra ?? currentProject.precio_mano_obra ?? 0,
@@ -2470,7 +2505,13 @@ app.put('/api/proyectos/:id', async (request, response) => {
     const finalCostoTotal = finalCostoMateriales + finalCostoManoObra;
     const finalPrecioCotizacion = finalCostoMateriales + finalPrecioManoObra;
     const finalDescripcion = merged.descripcion ?? null;
+    const finalImagen = merged.imagen || null;
     const finalEstado = merged.estado || 'Pendiente';
+
+    if (!isValidMaterialImage(finalImagen)) {
+      await connection.rollback();
+      return response.status(400).json({ message: `La foto debe ser JPG, PNG o WebP y no superar ${materialImageMaxMb} MB.` });
+    }
 
     if (!finalNombre || !finalClienteId || !finalUsuarioId || !finalLargo || !finalArea || !Number.isFinite(finalCostoMateriales) || finalCostoMateriales < 0 || !Number.isFinite(finalCostoManoObra) || finalCostoManoObra < 0 || !Number.isFinite(finalPrecioManoObra) || finalPrecioManoObra < 0) {
       await connection.rollback();
@@ -2479,9 +2520,9 @@ app.put('/api/proyectos/:id', async (request, response) => {
 
     const [result] = await connection.execute(
       `UPDATE proyectos
-      SET id_cliente = ?, id_usuario = ?, nombre_proyecto = ?, largo = ?, area_m2 = ?, altura = ?, tipo = ?, id_mano_obra = ?, mano_obra_precio_m2 = ?, estado = ?, costo_materiales = ?, costo_mano_obra = ?, precio_mano_obra = ?, costo_total = ?, precio_cotizacion = ?, costo_estimado = ?, fecha_inicio = ?, descripcion = ?
+      SET id_cliente = ?, id_usuario = ?, nombre_proyecto = ?, largo = ?, area_m2 = ?, altura = ?, tipo = ?, id_mano_obra = ?, mano_obra_precio_m2 = ?, estado = ?, costo_materiales = ?, costo_mano_obra = ?, precio_mano_obra = ?, costo_total = ?, precio_cotizacion = ?, costo_estimado = ?, fecha_inicio = ?, descripcion = ?, imagen = ?
        WHERE id_proyecto = ?`,
-          [finalClienteId, finalUsuarioId, finalNombre, finalLargo || null, finalArea, merged.altura ?? null, merged.tipo || null, merged.id_mano_obra || null, laborPriceM2, finalEstado, finalCostoMateriales, finalCostoManoObra, finalPrecioManoObra, finalCostoTotal, finalPrecioCotizacion, finalPresupuesto || finalPrecioCotizacion, finalFechaInicio || null, finalDescripcion || null, request.params.id]
+          [finalClienteId, finalUsuarioId, finalNombre, finalLargo || null, finalArea, merged.altura ?? null, merged.tipo || null, merged.id_mano_obra || null, laborPriceM2, finalEstado, finalCostoMateriales, finalCostoManoObra, finalPrecioManoObra, finalCostoTotal, finalPrecioCotizacion, finalPresupuesto || finalPrecioCotizacion, finalFechaInicio || null, finalDescripcion || null, finalImagen, request.params.id]
     );
 
     if (result.affectedRows === 0) return response.status(404).json({ message: 'Proyecto no encontrado.' });

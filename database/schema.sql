@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS proyectos (
   id_mano_obra INT NULL,
   mano_obra_precio_m2 DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   descripcion TEXT NULL,
+  imagen LONGTEXT NULL,
   estado ENUM('Pendiente', 'En proceso', 'Finalizado') NOT NULL DEFAULT 'Pendiente',
   estado_archivado ENUM('Activo', 'Archivado') NOT NULL DEFAULT 'Activo',
   costo_materiales DECIMAL(10,2) NOT NULL DEFAULT 0.00,
