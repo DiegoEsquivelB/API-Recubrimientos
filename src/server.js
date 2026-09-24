@@ -252,6 +252,39 @@ function requireAdministratorForDelete(request, response, next) {
   next();
 }
 
+const internalCostFields = new Set([
+  'costo',
+  'costo_estimado',
+  'costo_materiales',
+  'costo_herramientas',
+  'costo_mano_obra',
+  'costo_total',
+  'costo_subtotal',
+  'costo_unitario',
+  'costo_compra',
+  'costo_empresa',
+  'precio_empresa',
+  'precio_baja',
+  'mano_obra_precio_m2',
+  'precio_costo',
+  'cost',
+  'precio_unitario',
+  'precio_uso',
+  'detalle_peps'
+]);
+
+function redactInternalCosts(value) {
+  if (Array.isArray(value)) return value.map(redactInternalCosts);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !internalCostFields.has(key))
+    .map(([key, nestedValue]) => [key, redactInternalCosts(nestedValue)]));
+}
+
+function respondWithRoleCosts(request, response, value) {
+  response.json(request.user?.rol === 'Administrador' ? value : redactInternalCosts(value));
+}
+
 async function ensureDefaultAdminUser() {
   await pool.execute(
     `INSERT IGNORE INTO usuarios (nombre, email, password_hash, rol, estado)
@@ -1424,7 +1457,7 @@ app.get('/api/materiales', async (request, response) => {
       WHERE m.estado = ?
       ORDER BY m.id_material DESC
     `, [state]);
-    response.json(rows);
+    respondWithRoleCosts(request, response, rows);
   } catch (error) {
     console.error('Error al consultar materiales:', error);
     response.status(500).json({ message: 'No fue posible consultar los materiales.' });
@@ -1577,7 +1610,7 @@ app.get('/api/materiales/:id', async (request, response) => {
       WHERE m.id_material = ?
     `, [request.params.id]);
     if (!rows[0]) return response.status(404).json({ message: 'Material no encontrado.' });
-    response.json(rows[0]);
+    respondWithRoleCosts(request, response, rows[0]);
   } catch (_error) {
     response.status(500).json({ message: 'No fue posible consultar el material.' });
   }
@@ -1617,7 +1650,8 @@ app.post('/api/materiales', async (request, response) => {
   const materialTipo = categoria || tipo;
   const unidadMedida = unidad || unidad_medida || 'Galón';
   const rendimientoMaterial = Number(rendimiento ?? rendimiento_m2_gal ?? 0);
-  const precioUnitario = Number(costo ?? precio_unitario ?? 0);
+  const isAdministrator = request.user?.rol === 'Administrador';
+  const precioUnitario = isAdministrator ? Number(costo ?? precio_unitario ?? 0) : 0;
   const precioVenta = precio_venta === undefined || precio_venta === null || precio_venta === ''
     ? precioUnitario
     : Number(precio_venta);
@@ -1630,7 +1664,7 @@ app.post('/api/materiales', async (request, response) => {
   const shouldRegisterInventory = !isLabor;
   const initialStock = Number(stock_inicial || 0);
   const hasMarca = String(marca || '').trim().length > 0;
-  const hasCosto = costo !== undefined && costo !== null && String(costo).trim() !== ''
+  const hasCosto = !isAdministrator || (costo !== undefined && costo !== null && String(costo).trim() !== '')
     || precio_unitario !== undefined && precio_unitario !== null && String(precio_unitario).trim() !== '';
   const hasStockMinimo = stock_minimo !== undefined && stock_minimo !== null && String(stock_minimo).trim() !== '';
   const variationList = Array.isArray(variaciones) && variaciones.length
@@ -1736,8 +1770,9 @@ app.put('/api/materiales/:id', async (request, response) => {
   const materialTipo = categoria || tipo;
   const unidadMedida = unidad || unidad_medida || 'Galón';
   const rendimientoMaterial = Number(rendimiento ?? rendimiento_m2_gal ?? 0);
-  const precioUnitario = Number(costo ?? precio_unitario ?? 0);
-  const precioVenta = precio_venta === undefined || precio_venta === null || precio_venta === ''
+  const isAdministrator = request.user?.rol === 'Administrador';
+  let precioUnitario = Number(costo ?? precio_unitario ?? 0);
+  let precioVenta = precio_venta === undefined || precio_venta === null || precio_venta === ''
     ? precioUnitario
     : Number(precio_venta);
   let modoUso = modo_uso === 'Reutilizable' ? 'Reutilizable' : 'Consumible';
@@ -1747,7 +1782,7 @@ app.put('/api/materiales/:id', async (request, response) => {
   const requestedUserId = id_usuario || usuario_id || usuario || null;
   const isLabor = String(materialTipo || '').trim().toLowerCase() === 'mano de obra';
   const hasMarca = String(marca || '').trim().length > 0;
-  const hasCosto = costo !== undefined && costo !== null && String(costo).trim() !== ''
+  const hasCosto = !isAdministrator || (costo !== undefined && costo !== null && String(costo).trim() !== '')
     || precio_unitario !== undefined && precio_unitario !== null && String(precio_unitario).trim() !== '';
   const hasStockMinimo = stock_minimo !== undefined && stock_minimo !== null && String(stock_minimo).trim() !== '';
 
@@ -1762,9 +1797,15 @@ app.put('/api/materiales/:id', async (request, response) => {
     await connection.beginTransaction();
     const finalUserId = await resolveValidUserId(connection, sessionUserId, requestedUserId);
     const [currentMaterial] = await connection.execute(
-      'SELECT codigo, modo_uso, usos_estimados FROM materiales WHERE id_material = ? LIMIT 1',
+      'SELECT codigo, modo_uso, usos_estimados, precio_unitario, precio_venta FROM materiales WHERE id_material = ? LIMIT 1',
       [request.params.id]
     );
+    if (!isAdministrator && currentMaterial[0]) {
+      precioUnitario = Number(currentMaterial[0].precio_unitario || 0);
+      if (precio_venta === undefined || precio_venta === null || precio_venta === '') {
+        precioVenta = Number(currentMaterial[0].precio_venta ?? currentMaterial[0].precio_unitario ?? 0);
+      }
+    }
     if (modo_uso === undefined) modoUso = currentMaterial[0]?.modo_uso || 'Consumible';
     const finalUsosEstimados = usos_estimados === undefined ? Number(currentMaterial[0]?.usos_estimados || 1) : usosEstimados;
 
@@ -1932,7 +1973,7 @@ app.get('/api/proyectos', async (request, response) => {
         p.precio_mano_obra,
         p.costo_total,
         p.precio_cotizacion,
-        p.costo_estimado AS presupuesto,
+        p.precio_cotizacion AS presupuesto,
         p.costo_estimado,
         p.fecha_inicio,
         p.fecha_creacion,
@@ -1943,7 +1984,7 @@ app.get('/api/proyectos', async (request, response) => {
       WHERE p.estado_archivado = ?
       ORDER BY p.id_proyecto DESC
     `, [archiveState]);
-    response.json(rows);
+    respondWithRoleCosts(request, response, rows);
   } catch (error) {
     console.error('Error al consultar proyectos:', error);
     response.status(500).json({ message: 'No fue posible consultar los proyectos.' });
@@ -1983,6 +2024,7 @@ app.get('/api/dashboard/summary', async (_request, response) => {
 
 app.get('/api/reportes', async (request, response) => {
   const { tipo, desde, hasta, estado } = request.query;
+  const isAdministrator = request.user?.rol === 'Administrador';
   const definitions = {
     'Clientes registrados': {
       columns: ['ID', 'Nombre', 'Identificación', 'Teléfono', 'Correo', 'Dirección', 'Fecha de registro'],
@@ -1990,8 +2032,8 @@ app.get('/api/reportes', async (request, response) => {
       dateColumn: 'fecha_registro'
     },
     'Proyectos por estado': {
-      columns: ['ID', 'Proyecto', 'Cliente', 'Estado', 'Área (m²)', 'Costo estimado', 'Fecha de inicio'],
-      sql: 'SELECT p.id_proyecto, p.nombre_proyecto, c.nombre AS cliente, p.estado, p.area_m2, p.costo_estimado, p.fecha_inicio FROM proyectos p JOIN clientes c ON c.id_cliente = p.id_cliente WHERE 1 = 1',
+      columns: ['ID', 'Proyecto', 'Cliente', 'Estado', 'Área (m²)', ...(isAdministrator ? ['Costo estimado'] : []), 'Fecha de inicio'],
+      sql: `SELECT p.id_proyecto, p.nombre_proyecto, c.nombre AS cliente, p.estado, p.area_m2${isAdministrator ? ', p.costo_estimado' : ''}, p.fecha_inicio FROM proyectos p JOIN clientes c ON c.id_cliente = p.id_cliente WHERE 1 = 1`,
       dateColumn: 'p.fecha_inicio'
     },
     'Inventario actual': {
@@ -2004,8 +2046,8 @@ app.get('/api/reportes', async (request, response) => {
       dateColumn: 'mi.fecha'
     },
     'Consumo de materiales': {
-      columns: ['Material', 'Código', 'Cantidad consumida', 'Costo total'],
-      sql: 'SELECT m.nombre, m.codigo, SUM(pm.cantidad_calculada) AS cantidad_consumida, SUM(pm.costo_subtotal) AS costo_total FROM proyecto_materiales pm JOIN materiales m ON m.id_material = pm.id_material JOIN proyectos p ON p.id_proyecto = pm.id_proyecto WHERE 1 = 1 GROUP BY pm.id_material, m.nombre, m.codigo',
+      columns: ['Material', 'Código', 'Cantidad consumida', ...(isAdministrator ? ['Costo total'] : [])],
+      sql: `SELECT m.nombre, m.codigo, SUM(pm.cantidad_calculada) AS cantidad_consumida${isAdministrator ? ', SUM(pm.costo_subtotal) AS costo_total' : ''} FROM proyecto_materiales pm JOIN materiales m ON m.id_material = pm.id_material JOIN proyectos p ON p.id_proyecto = pm.id_proyecto WHERE 1 = 1 GROUP BY pm.id_material, m.nombre, m.codigo`,
       dateColumn: 'p.fecha_inicio'
     }
   };
@@ -2026,7 +2068,7 @@ app.get('/api/reportes', async (request, response) => {
     if (tipo.toLowerCase().includes('inventario')) await ensureInventorySupport();
     if (tipo.includes('Proyectos') || tipo === 'Consumo de materiales') await ensureProjectSupport();
     const [rows] = await pool.execute(sql, parameters);
-    response.json({ tipo, columnas: definition.columns, filas: rows, total: rows.length });
+    respondWithRoleCosts(request, response, { tipo, columnas: definition.columns, filas: rows, total: rows.length });
   } catch (error) {
     console.error('Error al generar reporte:', error);
     response.status(500).json({ message: 'No fue posible generar el reporte.' });
@@ -2061,7 +2103,7 @@ app.get('/api/proyectos/:id', async (request, response) => {
         p.precio_mano_obra,
         p.costo_total,
         p.precio_cotizacion,
-        p.costo_estimado AS presupuesto,
+        p.precio_cotizacion AS presupuesto,
         p.costo_estimado,
         p.fecha_inicio,
         p.fecha_creacion,
@@ -2082,7 +2124,7 @@ app.get('/api/proyectos/:id', async (request, response) => {
 
     const project = rows[0];
     project.materiales = materialRows;
-    response.json(project);
+    respondWithRoleCosts(request, response, project);
   } catch (error) {
     console.error('Error al consultar proyecto por id:', error);
     response.status(500).json({ message: 'No fue posible consultar el proyecto.' });
@@ -2114,13 +2156,13 @@ app.get('/api/proyectos/:id/materiales', async (request, response) => {
       ORDER BY pm.id_detalle ASC
     `, [request.params.id]);
 
-    response.json(rows);
+    respondWithRoleCosts(request, response, rows);
   } catch (error) {
     response.status(500).json({ message: 'No fue posible consultar los materiales del proyecto.' });
   }
 });
 
-app.get('/api/herramientas/disponibilidad', async (_request, response) => {
+app.get('/api/herramientas/disponibilidad', async (request, response) => {
   let connection;
   try {
     await ensureMaterialCategorySupport();
@@ -2146,7 +2188,7 @@ app.get('/api/herramientas/disponibilidad', async (_request, response) => {
       ORDER BY m.nombre
     `);
     await connection.commit();
-    response.json(rows);
+    respondWithRoleCosts(request, response, rows);
   } catch (error) {
     if (connection) await connection.rollback();
     console.error('Error al consultar herramientas:', error);
@@ -2165,7 +2207,7 @@ app.get('/api/proyectos/:id/herramientas', async (request, response) => {
       FROM proyecto_herramientas ph JOIN materiales m ON m.id_material = ph.id_material
       WHERE ph.id_proyecto = ? ORDER BY ph.id_asignacion DESC
     `, [request.params.id]);
-    response.json(rows);
+    respondWithRoleCosts(request, response, rows);
   } catch (_error) {
     response.status(500).json({ message: 'No fue posible consultar las herramientas del proyecto.' });
   }
@@ -2715,11 +2757,12 @@ app.post('/api/inventario/movimientos', async (request, response) => {
   const { material_id, material, id_usuario, usuario_id, usuario, tipo, fecha, cantidad, costo_unitario, referencia, notas, observacion } = request.body;
   const materialId = material_id || material;
   const movementNotes = notas || observacion;
+  const isAdministrator = request.user?.rol === 'Administrador';
   const unitCost = costo_unitario === '' || costo_unitario === null || costo_unitario === undefined
     ? null
     : Number(costo_unitario);
   if (!materialId || !tipo || !fecha || !cantidad) return response.status(400).json({ message: 'Material, tipo, fecha y cantidad son obligatorios.' });
-  if (String(tipo).toLowerCase() === 'entrada' && (!Number.isFinite(unitCost) || unitCost < 0)) return response.status(400).json({ message: 'El costo unitario es obligatorio para una entrada.' });
+  if (isAdministrator && String(tipo).toLowerCase() === 'entrada' && (!Number.isFinite(unitCost) || unitCost < 0)) return response.status(400).json({ message: 'El costo unitario es obligatorio para una entrada.' });
   await ensureInventorySupport();
   await ensureProjectSupport();
   const connection = await pool.getConnection();
@@ -2730,7 +2773,7 @@ app.post('/api/inventario/movimientos', async (request, response) => {
       id_usuario || usuario_id || usuario
     );
     const [materialRows] = await connection.execute(
-      'SELECT tipo FROM materiales WHERE id_material = ? LIMIT 1',
+      'SELECT tipo, precio_unitario FROM materiales WHERE id_material = ? LIMIT 1',
       [materialId]
     );
     if (!materialRows[0]) {
@@ -2740,7 +2783,9 @@ app.post('/api/inventario/movimientos', async (request, response) => {
       return response.status(400).json({ message: 'La mano de obra no utiliza movimientos de inventario.' });
     }
     await connection.beginTransaction();
-    const effectiveCost = Number.isFinite(unitCost) ? unitCost : null;
+    const effectiveCost = isAdministrator
+      ? (Number.isFinite(unitCost) ? unitCost : null)
+      : (String(tipo).toLowerCase() === 'entrada' ? Number(materialRows[0].precio_unitario || 0) : null);
     const [result] = await connection.execute(
       'INSERT INTO movimientos_inventario (material_id, id_usuario, tipo, fecha, cantidad, costo_unitario, referencia, notas) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [materialId, userId, tipo, fecha, cantidad, effectiveCost ?? 0, referencia || null, movementNotes || null]
@@ -2760,9 +2805,10 @@ app.put('/api/inventario/movimientos/:id', async (request, response) => {
   const { material_id, material, id_usuario, usuario_id, usuario, tipo, fecha, cantidad, costo_unitario, referencia, notas, observacion } = request.body;
   const materialId = material_id || material;
   const movementNotes = notas || observacion;
-  const unitCost = Number(costo_unitario ?? 0);
+  const isAdministrator = request.user?.rol === 'Administrador';
+  let unitCost = Number(costo_unitario ?? 0);
   if (!materialId || !tipo || !fecha || !cantidad) return response.status(400).json({ message: 'Material, tipo, fecha y cantidad son obligatorios.' });
-  if (!Number.isFinite(unitCost) || unitCost < 0) return response.status(400).json({ message: 'El costo unitario debe ser válido.' });
+  if (isAdministrator && (!Number.isFinite(unitCost) || unitCost < 0)) return response.status(400).json({ message: 'El costo unitario debe ser válido.' });
   await ensureInventorySupport();
   await ensureProjectSupport();
   const connection = await pool.getConnection();
@@ -2780,6 +2826,13 @@ app.put('/api/inventario/movimientos/:id', async (request, response) => {
     if (!rows[0]) {
       await connection.rollback();
       return response.status(404).json({ message: 'Movimiento no encontrado.' });
+    }
+    if (!isAdministrator) {
+      unitCost = rows[0].costo_unitario;
+      if (String(tipo).toLowerCase() === 'entrada') {
+        const [materialRows] = await connection.execute('SELECT precio_unitario FROM materiales WHERE id_material = ? LIMIT 1', [materialId]);
+        unitCost = Number(materialRows[0]?.precio_unitario ?? unitCost ?? 0);
+      }
     }
 
     if (rows[0].notas === 'Herramienta dada de baja en proyecto') {
