@@ -276,6 +276,7 @@ const internalCostFields = new Set([
 function redactInternalCosts(value) {
   if (Array.isArray(value)) return value.map(redactInternalCosts);
   if (!value || typeof value !== 'object') return value;
+  if (value instanceof Date) return value;
   return Object.fromEntries(Object.entries(value)
     .filter(([key]) => !internalCostFields.has(key))
     .map(([key, nestedValue]) => [key, redactInternalCosts(nestedValue)]));
