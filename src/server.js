@@ -1072,13 +1072,16 @@ app.post('/api/auth/login', async (request, response) => {
     const [rows] = await pool.execute(
       `SELECT id_usuario, nombre, email, password_hash, rol, estado
        FROM usuarios
-       WHERE email = ? AND estado = 'Activo'
+       WHERE email = ?
        LIMIT 1`,
       [usuario]
     );
     const user = rows[0];
     if (!user || !(await bcrypt.compare(contrasena, user.password_hash))) {
       return response.status(401).json({ message: 'Las credenciales no son válidas.' });
+    }
+    if (user.estado !== 'Activo') {
+      return response.status(403).json({ message: 'Este usuario está desactivado. Comuníquese con un administrador.' });
     }
     const rememberSession = ['1', 'true', 'on', true, 1].includes(recordar);
     response.cookie(sessionCookieName, createSessionToken(user, rememberSession), sessionCookieOptions(rememberSession));
