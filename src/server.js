@@ -2033,10 +2033,10 @@ app.post('/api/cotizaciones/enviar', async (request, response) => {
       const quantity = Number(rawItem?.cantidad);
       const unitPrice = Number(rawItem?.precio_unitario);
       if (!itemName || itemName.length > 150 || itemType.length > 40 || unit.length > 30
-        || !Number.isFinite(quantity) || quantity <= 0 || quantity > 1000000
+        || !Number.isInteger(quantity) || quantity <= 0 || quantity > 1000000
         || !Number.isFinite(unitPrice) || unitPrice < 0 || unitPrice > 999999999
-        || Number(quantity.toFixed(2)) !== quantity || Number(unitPrice.toFixed(2)) !== unitPrice) {
-        return response.status(400).json({ message: 'Revise las partidas: descripción, cantidad y precio deben ser válidos (hasta dos decimales).' });
+        || Number(unitPrice.toFixed(2)) !== unitPrice) {
+        return response.status(400).json({ message: 'Revise las partidas: artículo, cantidad entera y precio deben ser válidos.' });
       }
       const subtotal = Number((quantity * unitPrice).toFixed(2));
       items.push({ descripcion: itemName, tipo: itemType, unidad: unit, cantidad: quantity, precio_unitario: unitPrice, subtotal });
