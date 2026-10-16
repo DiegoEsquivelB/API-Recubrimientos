@@ -2012,6 +2012,10 @@ app.post('/api/cotizaciones/enviar', async (request, response) => {
   if (rawItems.length < 1 || rawItems.length > 50) {
     return response.status(400).json({ message: 'Agregue entre 1 y 50 partidas a la cotización.' });
   }
+  const itemTypes = rawItems.map((item) => String(item?.tipo || '').trim().toLocaleLowerCase('es'));
+  if (!itemTypes.includes('material') || !itemTypes.includes('mano de obra')) {
+    return response.status(400).json({ message: 'La cotización debe incluir al menos un material y una mano de obra.' });
+  }
   if (subjectInput.length > 160 || messageInput.length > 3000) {
     return response.status(400).json({ message: 'El asunto o el mensaje excede el límite permitido.' });
   }
