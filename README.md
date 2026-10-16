@@ -20,6 +20,7 @@ Esta API expone servicios para:
 - Express 5
 - MySQL 8+
 - mysql2
+- pdfkit
 - bcryptjs
 - cors
 - dotenv
@@ -82,6 +83,16 @@ COOKIE_SAMESITE=lax
 COOKIE_SECURE=false
 SESSION_COOKIE_NAME=recubrimientos_session
 ```
+
+Para habilitar el módulo de envío de cotizaciones, configura las credenciales de Brevo en el `.env` del backend. Usa una API key transaccional y un remitente registrado y verificado en Brevo:
+
+```env
+BREVO_API_KEY=tu_api_key_de_brevo
+BREVO_SENDER_EMAIL=cotizaciones@tudominio.com
+BREVO_SENDER_NAME=Recubrimientos Diego S.A.
+```
+
+La API key se mantiene en el servidor y no se expone al navegador. El módulo genera un PDF con el desglose de materiales, mano de obra y otros cargos, y lo adjunta al correo enviado mediante el endpoint transaccional `POST /v3/smtp/email` de Brevo.
 
 El límite de imagen de materiales es de 5 MB por defecto. Puede modificarse con la variable `MATERIAL_IMAGE_MAX_MB`; el límite JSON del API se ajusta automáticamente para admitir la imagen codificada en Base64.
 
@@ -213,6 +224,7 @@ Las categorías iniciales (`Pintura`, `Sellador`, `Esmalte`, `Impermeabilizante`
 - inventario con control de stock y lotes por PEPS
 - cálculo de costo por salida con base en lotes más antiguos
 - proyectos con materiales asignados, costos y detalle PEPS
+- cotizaciones independientes con partidas de materiales, mano de obra y herramientas, enviadas por Brevo
 - compatibilidad automática de esquema para cubrir columnas y tablas nuevas
 - validación de permisos por rol
 

@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const mysql = require('mysql2/promise');
+const { buildQuotePdfBuffer } = require('./quotePdf');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const app = express();
@@ -1981,6 +1982,105 @@ app.get('/api/finanzas/resumen', async (request, response) => {
   } catch (error) {
     console.error('Error al consultar resumen financiero:', error);
     response.status(500).json({ message: 'No fue posible consultar el resumen financiero.' });
+  }
+});
+
+app.post('/api/cotizaciones/enviar', async (request, response) => {
+  if (request.user?.rol !== 'Administrador') {
+    return response.status(403).json({ message: 'No tiene permisos para enviar cotizaciones.' });
+  }
+
+  const apiKey = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.BREVO_SENDER_EMAIL;
+  if (!apiKey || !senderEmail) {
+    return response.status(503).json({ message: 'Configure BREVO_API_KEY y BREVO_SENDER_EMAIL en el servidor para enviar cotizaciones.' });
+  }
+
+  const clientNameInput = String(request.body?.cliente_nombre || '').trim();
+  const recipientInput = String(request.body?.destinatario || '').trim();
+  const conceptInput = String(request.body?.concepto || '').trim();
+  const rawItems = Array.isArray(request.body?.items) ? request.body.items : [];
+  const subjectInput = String(request.body?.asunto || '').replace(/[\r\n\u0000-\u001f]/g, ' ').trim();
+  const messageInput = String(request.body?.mensaje || '').trim();
+  if (!clientNameInput || clientNameInput.length > 150 || !conceptInput || conceptInput.length > 150) {
+    return response.status(400).json({ message: 'El nombre del cliente y el concepto son obligatorios (máximo 150 caracteres).' });
+  }
+  if (rawItems.length < 1 || rawItems.length > 50) {
+    return response.status(400).json({ message: 'Agregue entre 1 y 50 partidas a la cotización.' });
+  }
+  if (subjectInput.length > 160 || messageInput.length > 3000) {
+    return response.status(400).json({ message: 'El asunto o el mensaje excede el límite permitido.' });
+  }
+
+  const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[character]);
+
+  try {
+    if (recipientInput.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientInput)) {
+      return response.status(400).json({ message: 'Ingrese un correo válido para el cliente.' });
+    }
+
+    const items = [];
+    for (const rawItem of rawItems) {
+      const itemName = String(rawItem?.descripcion || '').trim();
+      const itemType = String(rawItem?.tipo || 'Otro').trim();
+      const unit = String(rawItem?.unidad || 'unidad').trim();
+      const quantity = Number(rawItem?.cantidad);
+      const unitPrice = Number(rawItem?.precio_unitario);
+      if (!itemName || itemName.length > 150 || itemType.length > 40 || unit.length > 30
+        || !Number.isFinite(quantity) || quantity <= 0 || quantity > 1000000
+        || !Number.isFinite(unitPrice) || unitPrice < 0 || unitPrice > 999999999
+        || Number(quantity.toFixed(2)) !== quantity || Number(unitPrice.toFixed(2)) !== unitPrice) {
+        return response.status(400).json({ message: 'Revise las partidas: descripción, cantidad y precio deben ser válidos (hasta dos decimales).' });
+      }
+      const subtotal = Number((quantity * unitPrice).toFixed(2));
+      items.push({ descripcion: itemName, tipo: itemType, unidad: unit, cantidad: quantity, precio_unitario: unitPrice, subtotal });
+    }
+    const amount = Number(items.reduce((total, item) => total + item.subtotal, 0).toFixed(2));
+    if (amount <= 0 || amount > 999999999) {
+      return response.status(400).json({ message: 'El total de la cotización debe ser mayor que cero y no superar Q999,999,999.' });
+    }
+
+    const clientName = escapeHtml(clientNameInput);
+    const concept = escapeHtml(conceptInput);
+    const customMessage = escapeHtml(messageInput).replace(/\r?\n/g, '<br>');
+    const subject = subjectInput || `Cotización: ${conceptInput}`;
+    const formattedAmount = amount.toLocaleString('es-GT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const itemRows = items.map((item) => `<tr><td style="padding:10px;border-bottom:1px solid #e3e8ed">${escapeHtml(item.tipo)}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed">${escapeHtml(item.descripcion)}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">${item.cantidad.toLocaleString('es-GT', { maximumFractionDigits: 2 })} ${escapeHtml(item.unidad)}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">Q ${item.precio_unitario.toLocaleString('es-GT', { minimumFractionDigits: 2 })}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">Q ${item.subtotal.toLocaleString('es-GT', { minimumFractionDigits: 2 })}</td></tr>`).join('');
+    const htmlContent = `<!doctype html><html lang="es"><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#1a2c3d"><div style="max-width:760px;margin:32px auto;background:#fff;border-radius:14px;overflow:hidden"><div style="background:#d96d5c;color:#fff;padding:24px 30px"><h1 style="margin:0;font-size:23px">Cotización</h1><p style="margin:8px 0 0">Recubrimientos Diego S.A.</p></div><div style="padding:28px 30px"><p>Estimado/a ${clientName}:</p>${customMessage ? `<p>${customMessage}</p>` : '<p>Compartimos la cotización solicitada.</p>'}<h2 style="font-size:18px">${concept}</h2><table style="width:100%;border-collapse:collapse;margin:18px 0;font-size:14px"><thead><tr style="background:#f4f6f8"><th style="padding:10px;text-align:left">Tipo</th><th style="padding:10px;text-align:left">Descripción</th><th style="padding:10px;text-align:right">Cantidad</th><th style="padding:10px;text-align:right">Precio unitario</th><th style="padding:10px;text-align:right">Subtotal</th></tr></thead><tbody>${itemRows}</tbody></table><div style="background:#fce7e4;padding:18px 20px;border-radius:10px;text-align:right"><span style="color:#5c6d7d">Total cotizado</span><div style="font-size:26px;font-weight:700;color:#1a2c3d">Q ${formattedAmount}</div></div><p style="margin-top:24px;color:#5c6d7d;font-size:13px">Esta cotización se preparó con base en las partidas indicadas y puede estar sujeta a confirmación de los detalles del trabajo.</p></div></div></body></html>`;
+    const pdfBuffer = await buildQuotePdfBuffer({
+      customerName: clientNameInput,
+      recipient: recipientInput,
+      concept: conceptInput,
+      items,
+      total: amount,
+      message: messageInput
+    });
+    const fileSlug = conceptInput.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'Cotizacion';
+    const fileDate = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Guatemala' }).format(new Date());
+    const brevoResponse = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'api-key': apiKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sender: { email: senderEmail, name: process.env.BREVO_SENDER_NAME || 'Recubrimientos Diego S.A.' },
+        to: [{ email: recipientInput, name: clientNameInput.replace(/[\r\n\u0000-\u001f]/g, ' ').trim() }],
+        subject,
+        htmlContent,
+        attachment: [{ name: `Cotizacion_${fileDate}_${fileSlug}.pdf`, content: pdfBuffer.toString('base64') }]
+      }),
+      signal: AbortSignal.timeout(20000)
+    });
+    const brevoResult = await brevoResponse.json().catch(() => ({}));
+    if (!brevoResponse.ok) {
+      console.error('Brevo rechazó el envío de cotización:', brevoResult.message || brevoResponse.statusText);
+      return response.status(502).json({ message: 'Brevo no pudo enviar el correo. Revise la configuración del remitente y la API key.' });
+    }
+
+    response.json({ message: `Cotización enviada a ${recipientInput}.`, messageId: brevoResult.messageId });
+  } catch (error) {
+    console.error('Error al enviar cotización por Brevo:', error.message);
+    response.status(502).json({ message: error.name === 'TimeoutError' ? 'Brevo tardó demasiado en responder. Intente nuevamente.' : 'No se pudo enviar la cotización por correo.' });
   }
 });
 
