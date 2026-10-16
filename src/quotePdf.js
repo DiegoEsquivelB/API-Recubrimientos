@@ -4,7 +4,7 @@ function formatMoney(value) {
   return Number(value || 0).toLocaleString('es-GT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-function buildQuotePdfBuffer({ customerName, recipient, concept, items, total, message = '' }) {
+function buildQuotePdfBuffer({ customerName, recipient, concept, areaM2, items, total, message = '' }) {
   return new Promise((resolve, reject) => {
     const document = new PDFDocument({ size: 'LETTER', margins: { top: 42, bottom: 42, left: 44, right: 44 }, info: { Title: `Cotización - ${concept}`, Author: 'Recubrimientos Diego S.A.' } });
     const chunks = [];
@@ -62,18 +62,32 @@ function buildQuotePdfBuffer({ customerName, recipient, concept, items, total, m
       document.moveDown(1.4);
       document.fillColor('#1A2C3D').font('Helvetica-Bold').fontSize(16).text(concept, left, document.y, { width: tableWidth });
       document.moveDown(0.6);
+      document.fillColor('#1A2C3D').font('Helvetica-Bold').fontSize(10).text(`Área a pintar: ${Number(areaM2).toLocaleString('es-GT', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} m²`, left, document.y);
+      document.moveDown(0.8);
       if (message) {
         document.fillColor('#435666').font('Helvetica').fontSize(9.5).text(message, left, document.y, { width: tableWidth, lineGap: 2 });
         document.moveDown(0.8);
       }
-      document.moveDown(0.2);
-      drawTableHeading();
-
-      items.forEach((item) => {
+      const groups = items.reduce((result, item) => {
+        (result[item.tipo] ||= []).push(item);
+        return result;
+      }, {});
+      Object.entries(groups).forEach(([kind, groupItems]) => {
+        if (document.y + 48 > document.page.height - 42) startContinuationPage();
+        document.moveDown(0.6);
+        document.fillColor('#1A2C3D').font('Helvetica-Bold').fontSize(11).text(kind, left, document.y);
+        document.moveDown(0.4);
+        drawTableHeading();
+        groupItems.forEach((item) => {
         const descriptionHeight = document.heightOfString(item.descripcion, { width: columns[1].width - 12, font: 'Helvetica', fontSize: 9 });
         const typeHeight = document.heightOfString(item.tipo, { width: columns[0].width - 12, font: 'Helvetica', fontSize: 8.5 });
         const rowHeight = Math.max(30, descriptionHeight, typeHeight) + 12;
-        if (document.y + rowHeight + 94 > document.page.height - 42) startContinuationPage();
+        if (document.y + rowHeight + 94 > document.page.height - 42) {
+          startContinuationPage();
+          document.fillColor('#1A2C3D').font('Helvetica-Bold').fontSize(11).text(`${kind} (continuación)`, left, document.y);
+          document.moveDown(0.4);
+          drawTableHeading();
+        }
 
         const top = document.y;
         document.rect(left, top, tableWidth, rowHeight).stroke('#DDE4E9');
@@ -92,6 +106,7 @@ function buildQuotePdfBuffer({ customerName, recipient, concept, items, total, m
           x += column.width;
         });
         document.y = top + rowHeight;
+        });
       });
 
       if (document.y + 76 > document.page.height - 42) startContinuationPage();

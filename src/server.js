@@ -1999,11 +1999,15 @@ app.post('/api/cotizaciones/enviar', async (request, response) => {
   const clientNameInput = String(request.body?.cliente_nombre || '').trim();
   const recipientInput = String(request.body?.destinatario || '').trim();
   const conceptInput = String(request.body?.concepto || '').trim();
+  const areaM2 = Number(request.body?.area_m2);
   const rawItems = Array.isArray(request.body?.items) ? request.body.items : [];
   const subjectInput = String(request.body?.asunto || '').replace(/[\r\n\u0000-\u001f]/g, ' ').trim();
   const messageInput = String(request.body?.mensaje || '').trim();
   if (!clientNameInput || clientNameInput.length > 150 || !conceptInput || conceptInput.length > 150) {
     return response.status(400).json({ message: 'El nombre del cliente y el concepto son obligatorios (máximo 150 caracteres).' });
+  }
+  if (!Number.isFinite(areaM2) || areaM2 <= 0 || areaM2 > 1000000 || Number(areaM2.toFixed(2)) !== areaM2) {
+    return response.status(400).json({ message: 'Ingrese un área válida en m² (hasta dos decimales).' });
   }
   if (rawItems.length < 1 || rawItems.length > 50) {
     return response.status(400).json({ message: 'Agregue entre 1 y 50 partidas a la cotización.' });
@@ -2047,12 +2051,21 @@ app.post('/api/cotizaciones/enviar', async (request, response) => {
     const customMessage = escapeHtml(messageInput).replace(/\r?\n/g, '<br>');
     const subject = subjectInput || `Cotización: ${conceptInput}`;
     const formattedAmount = amount.toLocaleString('es-GT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const itemRows = items.map((item) => `<tr><td style="padding:10px;border-bottom:1px solid #e3e8ed">${escapeHtml(item.tipo)}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed">${escapeHtml(item.descripcion)}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">${item.cantidad.toLocaleString('es-GT', { maximumFractionDigits: 2 })} ${escapeHtml(item.unidad)}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">Q ${item.precio_unitario.toLocaleString('es-GT', { minimumFractionDigits: 2 })}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">Q ${item.subtotal.toLocaleString('es-GT', { minimumFractionDigits: 2 })}</td></tr>`).join('');
-    const htmlContent = `<!doctype html><html lang="es"><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#1a2c3d"><div style="max-width:760px;margin:32px auto;background:#fff;border-radius:14px;overflow:hidden"><div style="background:#d96d5c;color:#fff;padding:24px 30px"><h1 style="margin:0;font-size:23px">Cotización</h1><p style="margin:8px 0 0">Recubrimientos Diego S.A.</p></div><div style="padding:28px 30px"><p>Estimado/a ${clientName}:</p>${customMessage ? `<p>${customMessage}</p>` : '<p>Compartimos la cotización solicitada.</p>'}<h2 style="font-size:18px">${concept}</h2><table style="width:100%;border-collapse:collapse;margin:18px 0;font-size:14px"><thead><tr style="background:#f4f6f8"><th style="padding:10px;text-align:left">Tipo</th><th style="padding:10px;text-align:left">Descripción</th><th style="padding:10px;text-align:right">Cantidad</th><th style="padding:10px;text-align:right">Precio unitario</th><th style="padding:10px;text-align:right">Subtotal</th></tr></thead><tbody>${itemRows}</tbody></table><div style="background:#fce7e4;padding:18px 20px;border-radius:10px;text-align:right"><span style="color:#5c6d7d">Total cotizado</span><div style="font-size:26px;font-weight:700;color:#1a2c3d">Q ${formattedAmount}</div></div><p style="margin-top:24px;color:#5c6d7d;font-size:13px">Esta cotización se preparó con base en las partidas indicadas y puede estar sujeta a confirmación de los detalles del trabajo.</p></div></div></body></html>`;
+    const itemGroups = items.reduce((groups, item) => {
+      (groups[item.tipo] ||= []).push(item);
+      return groups;
+    }, {});
+    const groupTables = Object.entries(itemGroups).map(([kind, groupItems]) => {
+      const itemRows = groupItems.map((item) => `<tr><td style="padding:10px;border-bottom:1px solid #e3e8ed">${escapeHtml(item.descripcion)}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">${item.cantidad.toLocaleString('es-GT', { maximumFractionDigits: 2 })} ${escapeHtml(item.unidad)}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">Q ${item.precio_unitario.toLocaleString('es-GT', { minimumFractionDigits: 2 })}</td><td style="padding:10px;border-bottom:1px solid #e3e8ed;text-align:right">Q ${item.subtotal.toLocaleString('es-GT', { minimumFractionDigits: 2 })}</td></tr>`).join('');
+      return `<h3 style="margin:22px 0 8px;font-size:16px">${escapeHtml(kind)}</h3><table style="width:100%;border-collapse:collapse;margin:0 0 16px;font-size:14px"><thead><tr style="background:#f4f6f8"><th style="padding:10px;text-align:left">Descripción</th><th style="padding:10px;text-align:right">Cantidad</th><th style="padding:10px;text-align:right">Precio unitario</th><th style="padding:10px;text-align:right">Subtotal</th></tr></thead><tbody>${itemRows}</tbody></table>`;
+    }).join('');
+    const formattedArea = areaM2.toLocaleString('es-GT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const htmlContent = `<!doctype html><html lang="es"><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#1a2c3d"><div style="max-width:760px;margin:32px auto;background:#fff;border-radius:14px;overflow:hidden"><div style="background:#d96d5c;color:#fff;padding:24px 30px"><h1 style="margin:0;font-size:23px">Cotización</h1><p style="margin:8px 0 0">Recubrimientos Diego S.A.</p></div><div style="padding:28px 30px"><p>Estimado/a ${clientName}:</p>${customMessage ? `<p>${customMessage}</p>` : '<p>Compartimos la cotización solicitada.</p>'}<h2 style="font-size:18px">${concept}</h2><p style="padding:12px;background:#f4f6f8;border-radius:8px"><strong>Área a pintar:</strong> ${formattedArea} m²</p>${groupTables}<div style="background:#fce7e4;padding:18px 20px;border-radius:10px;text-align:right"><span style="color:#5c6d7d">Total cotizado</span><div style="font-size:26px;font-weight:700;color:#1a2c3d">Q ${formattedAmount}</div></div><p style="margin-top:24px;color:#5c6d7d;font-size:13px">Esta cotización se preparó con base en las partidas indicadas y puede estar sujeta a confirmación de los detalles del trabajo.</p></div></div></body></html>`;
     const pdfBuffer = await buildQuotePdfBuffer({
       customerName: clientNameInput,
       recipient: recipientInput,
       concept: conceptInput,
+      areaM2,
       items,
       total: amount,
       message: messageInput
