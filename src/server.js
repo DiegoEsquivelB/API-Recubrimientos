@@ -1946,6 +1946,44 @@ app.patch('/api/materiales/:id/desarchivar', async (request, response) => {
   }
 });
 
+app.get('/api/finanzas/resumen', async (request, response) => {
+  if (request.user?.rol !== 'Administrador') {
+    return response.status(403).json({ message: 'No tiene permisos para consultar el módulo de finanzas.' });
+  }
+
+  try {
+    await ensureProjectSupport();
+    await ensureArchiveSupport();
+    const [projects] = await pool.query(`
+      SELECT id_proyecto AS id, nombre_proyecto AS nombre, c.nombre AS cliente_nombre,
+        estado, fecha_inicio, COALESCE(NULLIF(precio_cotizacion, 0), costo_estimado, 0) AS ingreso_estimado,
+        COALESCE(NULLIF(costo_total, 0), costo_estimado, 0) AS costo_estimado,
+        COALESCE(NULLIF(precio_cotizacion, 0), costo_estimado, 0) - COALESCE(NULLIF(costo_total, 0), costo_estimado, 0) AS utilidad_estimada
+      FROM proyectos p
+      LEFT JOIN clientes c ON c.id_cliente = p.id_cliente
+      WHERE p.estado_archivado = 'Activo'
+      ORDER BY p.fecha_inicio DESC, p.id_proyecto DESC
+    `);
+    const summary = projects.reduce((totals, project) => {
+      totals.ingresos += Number(project.ingreso_estimado || 0);
+      totals.costos += Number(project.costo_estimado || 0);
+      return totals;
+    }, { ingresos: 0, costos: 0 });
+    response.json({
+      resumen: {
+        ingresos_estimados: Number(summary.ingresos.toFixed(2)),
+        costos_estimados: Number(summary.costos.toFixed(2)),
+        utilidad_estimada: Number((summary.ingresos - summary.costos).toFixed(2)),
+        proyectos: projects.length
+      },
+      proyectos: projects
+    });
+  } catch (error) {
+    console.error('Error al consultar resumen financiero:', error);
+    response.status(500).json({ message: 'No fue posible consultar el resumen financiero.' });
+  }
+});
+
 app.get('/api/proyectos', async (request, response) => {
   try {
     await ensureProjectSupport();
