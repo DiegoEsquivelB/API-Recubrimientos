@@ -301,6 +301,21 @@ async function ensureDefaultAdminUser() {
   );
 }
 
+async function ensurePasswordResetSupport() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tokens_restablecimiento_contrasena (
+      id_token BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id_usuario INT NOT NULL,
+      token_hash CHAR(64) NOT NULL UNIQUE,
+      expira_en DATETIME NOT NULL,
+      creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_reset_usuario_creado (id_usuario, creado_en),
+      CONSTRAINT fk_reset_usuario FOREIGN KEY (id_usuario)
+        REFERENCES usuarios(id_usuario) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+}
+
 async function ensureUserDeleteAuditTrigger() {
   await pool.query('DROP TRIGGER IF EXISTS trg_aud_usuarios_delete');
   await pool.query(`
@@ -1099,6 +1114,123 @@ app.post('/api/auth/login', async (request, response) => {
     });
   } catch (_error) {
     response.status(500).json({ message: 'No fue posible consultar la base de datos.' });
+  }
+});
+
+app.post('/api/auth/password-reset/request', async (request, response) => {
+  const genericResponse = { message: 'Si el correo corresponde a una cuenta activa, recibirá instrucciones para restablecer su contraseña.' };
+  const email = String(request.body?.email || '').trim().toLowerCase();
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return response.status(400).json({ message: 'Ingrese un correo electrónico válido.' });
+  }
+
+  const apiKey = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.BREVO_SENDER_EMAIL;
+  const frontendOrigin = String(process.env.FRONTEND_URL || '').split(',')[0].trim().replace(/\/$/, '');
+  if (!apiKey || !senderEmail || !frontendOrigin) {
+    return response.status(503).json({ message: 'Configure BREVO_API_KEY, BREVO_SENDER_EMAIL y FRONTEND_URL en el servidor para recuperar contraseñas.' });
+  }
+
+  let pendingTokenHash = null;
+  try {
+    await ensureDefaultAdminUser();
+    await ensurePasswordResetSupport();
+    const [users] = await pool.execute(
+      "SELECT id_usuario, nombre, email FROM usuarios WHERE LOWER(email) = ? AND estado = 'Activo' LIMIT 1",
+      [email]
+    );
+    const user = users[0];
+    if (!user) return response.json(genericResponse);
+
+    const [recentRequests] = await pool.execute(
+      'SELECT id_token FROM tokens_restablecimiento_contrasena WHERE id_usuario = ? AND creado_en > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 MINUTE) LIMIT 1',
+      [user.id_usuario]
+    );
+    if (recentRequests.length) return response.json(genericResponse);
+
+    let resetUrl;
+    try {
+      const origin = new URL(frontendOrigin);
+      if (!['http:', 'https:'].includes(origin.protocol)) throw new Error('Protocolo no válido.');
+      resetUrl = new URL('/restablecer-contrasena.html', origin);
+    } catch (_error) {
+      return response.status(503).json({ message: 'FRONTEND_URL debe ser una dirección web válida para recuperar contraseñas.' });
+    }
+
+    const token = crypto.randomBytes(32).toString('base64url');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    pendingTokenHash = tokenHash;
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+    await pool.execute('DELETE FROM tokens_restablecimiento_contrasena WHERE id_usuario = ?', [user.id_usuario]);
+    await pool.execute(
+      'INSERT INTO tokens_restablecimiento_contrasena (id_usuario, token_hash, expira_en) VALUES (?, ?, ?)',
+      [user.id_usuario, tokenHash, expiresAt]
+    );
+
+    resetUrl.searchParams.set('token', token);
+
+    const safeName = String(user.nombre || 'usuario').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+    const brevoResponse = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'api-key': apiKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sender: { email: senderEmail, name: process.env.BREVO_SENDER_NAME || 'Recubrimientos Diego S.A.' },
+        to: [{ email: user.email, name: user.nombre }],
+        subject: 'Restablecer contraseña',
+        htmlContent: `<!doctype html><html lang="es"><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#1a2c3d"><div style="max-width:600px;margin:32px auto;background:#fff;border-radius:14px;padding:32px"><h1 style="color:#d9584d">Restablecer contraseña</h1><p>Hola ${safeName},</p><p>Recibimos una solicitud para cambiar la contraseña de tu cuenta.</p><p style="margin:28px 0"><a href="${resetUrl.href}" style="background:#d9584d;color:#fff;text-decoration:none;padding:14px 22px;border-radius:10px;font-weight:bold">Crear nueva contraseña</a></p><p>Este enlace vence en 30 minutos y solo puede utilizarse una vez. Si no solicitaste el cambio, puedes ignorar este correo.</p></div></body></html>`
+      }),
+      signal: AbortSignal.timeout(20000)
+    });
+    if (!brevoResponse.ok) {
+      const result = await brevoResponse.json().catch(() => ({}));
+      console.error('Brevo rechazó el correo de recuperación:', result.message || brevoResponse.statusText);
+      await pool.execute('DELETE FROM tokens_restablecimiento_contrasena WHERE token_hash = ?', [tokenHash]);
+      return response.status(502).json({ message: 'No se pudo enviar el correo. Intente nuevamente más tarde.' });
+    }
+    response.json(genericResponse);
+  } catch (error) {
+    console.error('Error al solicitar restablecimiento de contraseña:', error.message);
+    if (pendingTokenHash) {
+      await pool.execute('DELETE FROM tokens_restablecimiento_contrasena WHERE token_hash = ?', [pendingTokenHash]).catch(() => {});
+    }
+    response.status(500).json({ message: 'No fue posible procesar la solicitud de recuperación.' });
+  }
+});
+
+app.post('/api/auth/password-reset/confirm', async (request, response) => {
+  const token = String(request.body?.token || '');
+  const password = String(request.body?.password || '');
+  if (!/^[A-Za-z0-9_-]{40,50}$/.test(token)) {
+    return response.status(400).json({ message: 'El enlace de recuperación no es válido o ya venció.' });
+  }
+  if (password.length < 8 || password.length > 128) {
+    return response.status(400).json({ message: 'La contraseña debe tener entre 8 y 128 caracteres.' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await ensurePasswordResetSupport();
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    await connection.beginTransaction();
+    const [tokens] = await connection.execute(
+      'SELECT id_token, id_usuario FROM tokens_restablecimiento_contrasena WHERE token_hash = ? AND expira_en > UTC_TIMESTAMP() LIMIT 1 FOR UPDATE',
+      [tokenHash]
+    );
+    if (!tokens[0]) {
+      await connection.rollback();
+      return response.status(400).json({ message: 'El enlace de recuperación no es válido o ya venció.' });
+    }
+    const passwordHash = await bcrypt.hash(password, 12);
+    await connection.execute('UPDATE usuarios SET password_hash = ? WHERE id_usuario = ?', [passwordHash, tokens[0].id_usuario]);
+    await connection.execute('DELETE FROM tokens_restablecimiento_contrasena WHERE id_usuario = ?', [tokens[0].id_usuario]);
+    await connection.commit();
+    response.json({ message: 'La contraseña se actualizó correctamente. Ya puede iniciar sesión.' });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error al restablecer contraseña:', error.message);
+    response.status(500).json({ message: 'No fue posible actualizar la contraseña.' });
+  } finally {
+    connection.release();
   }
 });
 

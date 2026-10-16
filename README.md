@@ -94,6 +94,8 @@ BREVO_SENDER_NAME=Recubrimientos Diego S.A.
 
 La API key se mantiene en el servidor y no se expone al navegador. El módulo genera un PDF con el desglose de materiales, mano de obra y otros cargos, y lo adjunta al correo enviado mediante el endpoint transaccional `POST /v3/smtp/email` de Brevo.
 
+La recuperación de contraseña reutiliza esas credenciales de Brevo y `FRONTEND_URL` para enviar un enlace de un solo uso que vence en 30 minutos. Configura `FRONTEND_URL` con la URL pública del frontend en Railway (puede incluir varios orígenes separados por comas); la tabla de tokens se crea automáticamente.
+
 El límite de imagen de materiales es de 5 MB por defecto. Puede modificarse con la variable `MATERIAL_IMAGE_MAX_MB`; el límite JSON del API se ajusta automáticamente para admitir la imagen codificada en Base64.
 
 > `FRONTEND_URL` puede recibir varios orígenes separados por comas.
