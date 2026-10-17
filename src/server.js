@@ -1112,7 +1112,8 @@ app.post('/api/auth/login', async (request, response) => {
         estado: user.estado
       }
     });
-  } catch (_error) {
+  } catch (err) {
+    console.error('[auth/login] error:', err);
     response.status(500).json({ message: 'No fue posible consultar la base de datos.' });
   }
 });
