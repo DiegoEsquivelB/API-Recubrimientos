@@ -1054,6 +1054,27 @@ app.use(cors({
   credentials: true
 }));
 
+// Emit one structured, privacy-safe access log per API request. Never log
+// query strings, headers, cookies, or request bodies because they may contain
+// passwords, reset tokens, session cookies, or personal data.
+app.use('/api', (request, response, next) => {
+  const startedAt = process.hrtime.bigint();
+  response.on('finish', () => {
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    const level = response.statusCode >= 500 ? 'error' : response.statusCode >= 400 ? 'warn' : 'info';
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level,
+      event: 'http_request',
+      method: request.method,
+      path: request.path,
+      status: response.statusCode,
+      duration_ms: Number(durationMs.toFixed(2))
+    }));
+  });
+  next();
+});
+
 app.use(express.json({ limit: `${jsonBodyLimitMb}mb` }));
 
 app.get('/', (_request, response) => {
@@ -1160,11 +1181,10 @@ app.post('/api/auth/password-reset/request', async (request, response) => {
     const token = crypto.randomBytes(32).toString('base64url');
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     pendingTokenHash = tokenHash;
-    const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
     await pool.execute('DELETE FROM tokens_restablecimiento_contrasena WHERE id_usuario = ?', [user.id_usuario]);
     await pool.execute(
-      'INSERT INTO tokens_restablecimiento_contrasena (id_usuario, token_hash, expira_en) VALUES (?, ?, ?)',
-      [user.id_usuario, tokenHash, expiresAt]
+      'INSERT INTO tokens_restablecimiento_contrasena (id_usuario, token_hash, expira_en) VALUES (?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE))',
+      [user.id_usuario, tokenHash]
     );
 
     resetUrl.searchParams.set('token', token);
@@ -3190,4 +3210,3 @@ app.delete('/api/inventario/movimientos/:id', requireAdministratorForDelete, asy
 app.use((_request, response) => response.status(404).json({ message: 'Ruta no encontrada.' }));
 
 app.listen(port, () => console.log(`API disponible en http://localhost:${port}`));
-
